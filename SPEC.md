@@ -46,15 +46,18 @@ the same shape. Lock these globally:
 
 ---
 
-## 3. The tool surface (10 tools)
+## 3. The tool surface (14 tools)
 
-Split into **discovery** (cast wide, ranked candidate sets) and **evidence** (drill one
-item). Seven are the directive's; `quote` is added because the directive's falsification
-step requires per-leg freshness for a single item and no other tool returns it.
-`quotes` and `seasonality` (plus three new `screen` metrics) were added
-in the 2026-07-13 money-signals amendment ([QUERIES #12–#16](./QUERIES.md#money-signals-2026-07-13-amendment--all-validated-live))
-after reviewing 26 days of accumulated data. (`alch_screen` was also added then, and
-removed 2026-07-14 when alching was dropped as a strategy.)
+Split into **discovery** (cast wide, ranked candidate sets), **evidence** (drill one
+item) and **conversions** (multi-leg pricing). Seven are the original directive's;
+`quote` is added because the directive's falsification step requires per-leg freshness
+for a single item and no other tool returns it. `quotes` and `seasonality` (plus three
+new `screen` metrics) were added in the 2026-07-13 money-signals amendment
+([QUERIES #12–#16](./QUERIES.md#money-signals-2026-07-13-amendment--all-validated-live)).
+(`alch_screen` was also added then, and removed 2026-07-14 when alching was dropped as
+a strategy.) The 2026-07-14 archetype re-architecture (S/V/C/U/H) extended
+`seasonality` (hour-of-week + price level) and added `seasonal_scan`, `volume_zscore`,
+`list_relations`, `combo_quote` ([QUERIES #17–#21](./QUERIES.md#new-archetypes-2026-07-14-re-architecture--all-validated-live)).
 
 ### Discovery
 
@@ -103,15 +106,60 @@ One tool, **metric-tagged**, for the seven ranking lenses.
 - **Backed by:** [QUERIES #6–9](./QUERIES.md#6-volatility-ranking--best-range-trade-candidates),
   [#13–#15](./QUERIES.md#13-order-flow-imbalance--screen-metric)
 
-#### `seasonality`
-Hour-of-day / day-of-week structure in margins and volume (archetype F — unlocked
-2026-07-13 on data age; raw scans, no CAGG, slow is fine per §6).
-- **Params:** `dimension ∈ hour | dow`, `name_or_id?` (optional item filter; global
-  when omitted)
-- **Returns per row:** `bucket` (hour 0–23 UTC or dow 0–6), `avg_margin, obs`
-- dow buckets have ~4 samples of each weekday per month of data — `obs` keeps the
-  confidence rules honest.
-- **Backed by:** [QUERIES #10–11](./QUERIES.md#10-hour-of-day-seasonality--unlocked)
+#### `seasonality`  *(v2 — hour-of-week + price level, archetype S)*
+Time-of-cycle structure. Per item: margin structure PLUS `price_index` (bucket mean
+mid-price ÷ item overall mean — the "cheap at hour A, dear at hour B" signal),
+`volume`, `vol_share`. Global: margin + volume only (no cross-item price averaging —
+see #18's normalization; that's `seasonal_scan`). Raw scans, slow is fine per §6.
+- **Params:** `dimension ∈ hour | dow | how` (how = hour-of-week 0–167, `dow*24+hour`
+  UTC, dow 0=Sunday), `name_or_id?`, `smooth` (how only, default true: hour±1 pooling
+  within the same day)
+- **Returns per row:** `bucket, avg_margin, obs, raw_obs, volume, vol_share,
+  price_index` (price_index null in global mode)
+- how buckets sample only ~4 calendar days per month of data even pooled — `obs` keeps
+  confidence honest, and a secular trend fakes hour-of-week structure (falsify vs
+  `item_history`).
+- **Backed by:** [QUERIES #10–11](./QUERIES.md#10-hour-of-day-seasonality--unlocked),
+  [#17](./QUERIES.md#17-hour-of-week-seasonality-price-level--smoothed--seasonality-v2)
+
+#### `seasonal_scan`  *(archetype S discovery)*
+Rank ALL items by hour-of-week price amplitude (max pooled `price_index` − min) so S
+candidates surface in one call. ~12s full-history scan.
+- **Params:** `min_avg_vol5m=500, min_price=250, min_obs=9, members?, limit=25`
+- **Returns per row:** `item_id, name, buy_limit, members, amplitude_pct,
+  cheap_bucket, cheap_idx, dear_bucket, dear_idx, min_bucket_obs, avg_vol5m,
+  mean_price` (buckets are hour±1 pooled ≈ 3h windows)
+- **Backed by:** [QUERIES #18](./QUERIES.md#18-hour-of-week-amplitude-scan--seasonal_scan)
+
+#### `volume_zscore`  *(archetype V trigger)*
+Current volume vs the item's own baseline, ranked by |z|. The orchestrator's armed
+trigger runs the same computation (kept in sync by design).
+- **Params:** `name_or_id?` (scan when omitted), `window='1h'`,
+  `baseline ∈ same_how | trailing`, `min_baseline_obs=3, min_volume=100, limit=25`
+- **Returns per row:** `item_id, name, cur_vol, baseline_mean, baseline_sd, z_score,
+  n_baseline, buys, sells, cur_price, price_move_pct`
+- **Backed by:** [QUERIES #19](./QUERIES.md#19-volume-z-score--volume_zscore)
+
+### Conversions (archetype C)
+
+#### `list_relations`
+The curated conversion universe (`item_relations`: decants / sets / combines). Legs
+enriched with names + buy limits from `items` at query time; `notes` carry skill/quest
+gates and fees.
+- **Params:** `kind?, name_or_id?, limit=50`
+- **Returns per row:** `relation_id, kind, name, reversible, notes,
+  inputs[{item_id, qty, name, buy_limit}], outputs[...]`
+- **Backed by:** [QUERIES #20](./QUERIES.md#20-relations-listing--list_relations)
+
+#### `combo_quote`
+Price one relation end-to-end at the latest quotes: buy legs at `low`, sell legs at
+`high` − per-leg tax `LEAST(high/50, 5M)`. Null leg ⇒ null combo_margin (signal).
+- **Params:** `relation_id` (required), `direction ∈ forward | reverse` (reverse only
+  if reversible — typed error `not_reversible`)
+- **Returns:** one row per leg (`side, item_id, name, qty, buy_limit, price, tax,
+  age_s, vol5m`) + `meta.summary` (`input_cost, output_revenue_post_tax, combo_margin,
+  roi_pct, max_leg_age_s, min_leg_vol5m, units_bound_per_4h, notes`)
+- **Backed by:** [QUERIES #21](./QUERIES.md#21-conversion-quote--combo_quote)
 
 ### Evidence
 
@@ -162,10 +210,10 @@ Summed recent 5m volume for sizing. Accepts `name_or_id` (not bare `item_id`) to
 - ~~**Seasonality**~~ — **moved in-scope 2026-07-13**: the data-age bar (~3–4 weeks) has
   been reached, and §6 already resolved that raw scans are acceptable (no CAGG, no schema
   change). Now specced as the `seasonality` tool in §3.
-- **Combo / related items** (set-vs-components, raw-vs-processed). No relationship data
-  exists in `items`, so the directive's combo paragraph is currently unbacked. Either cut
-  it from v1 or add a `quotes([name_or_id])` batch tool *and* accept there is no
-  set→component mapping yet.
+- ~~**Combo / related items**~~ — **moved in-scope 2026-07-14**: the archetype
+  re-architecture added the hand-curated `item_relations` table (ge-data
+  `init/02`/`init/03`) and the `list_relations` / `combo_quote` tools in §3. The
+  original objection (no relationship data exists) was resolved by curating it.
 
 ---
 

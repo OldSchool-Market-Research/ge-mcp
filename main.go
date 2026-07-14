@@ -46,6 +46,11 @@ func main() {
 	s.AddTool(tools.NewMoversTool(), tools.MoversHandler(pool))
 	s.AddTool(tools.NewScreenTool(), tools.ScreenHandler(pool))
 	s.AddTool(tools.NewSeasonalityTool(), tools.SeasonalityHandler(pool))
+	s.AddTool(tools.NewSeasonalScanTool(), tools.SeasonalScanHandler(pool))
+	s.AddTool(tools.NewVolumeZscoreTool(), tools.VolumeZscoreHandler(pool))
+	// Conversions (archetype C)
+	s.AddTool(tools.NewListRelationsTool(), tools.ListRelationsHandler(pool))
+	s.AddTool(tools.NewComboQuoteTool(), tools.ComboQuoteHandler(pool))
 
 	if err := server.ServeStdio(s); err != nil {
 		log.Fatalf("serve: %v", err)

@@ -464,6 +464,88 @@ column keeps the confidence rules honest.
 
 ---
 
+## New archetypes (2026-07-14 re-architecture — all validated live)
+
+The S/V/C/U/H archetype set replaced A–F; these queries back the new tool surface.
+All bucket math uses `ts AT TIME ZONE 'utc'` explicitly (prod runs GMT today, but a
+server timezone change must never silently shift buckets). Hour-of-week convention:
+`dow*24 + hour`, dow 0 = Sunday — identical to Go's `time.Weekday`.
+
+### 17. Hour-of-week seasonality, price-level + smoothed — `seasonality` v2
+**Answers:** is item X systematically *cheaper* in hour-of-week window A and *dearer*
+in window B? (The old #10/#11 gave margin structure only — spread width, not price
+level, and no 168-bucket dimension.) `price_index` = bucket mean mid-price (from
+`prices_5m`, per-side null-preserving) ÷ the item's whole-window mean; 1.00 = average.
+`smooth` pools hour±1 *within the same day* (wrap 0↔23): at ~4 weeks a raw how bucket
+holds ~36 5m rows but only ~4 distinct calendar days — pooling triples rows, the
+day-sample thinness remains, so `obs`/`raw_obs` both ship. Validated on Prayer
+potion(4): 168 buckets, 155 ms, pooled obs 108/raw 36, amplitude ~0.5% (below tax —
+correctly boring).
+- Per-item smoothed SQL: see `internal/tools/seasonality.go` (`seasonalityItemHowSmoothSQL`).
+- **Global mode has no `price_index`**: averaging raw prices across items is
+  meaningless (expensive items dominate). The per-item-normalized version of that
+  question is #18. Global keeps margin + summed volume/vol_share.
+- **Gotcha (trend confound):** with each how bucket sampling only ~4 calendar days, a
+  secular trend masquerades as hour-of-week structure. Falsify any seasonal claim
+  against the item's multi-week trend (`item_history`) before acting.
+- **→ tool:** `seasonality(dimension ∈ hour|dow|how, name_or_id?, smooth=true)`
+
+### 18. Hour-of-week amplitude scan — `seasonal_scan`
+**Answers:** which items have the largest hour-of-week price swings (archetype-S
+discovery)? Full-market version of #17: per item, pooled bucket `price_index`, then
+amplitude = max − min with the argmin/argmax buckets. Gates: `min_avg_vol5m` (default
+500), `min_price` (250 — cheap items are pure print-noise amplitude; validated: without
+the gate the top of the list is 10gp junk swinging 15×), `min_obs` per pooled bucket
+(9), full 168-bucket coverage (`HAVING count(*) = 168` — partial coverage fakes
+amplitude). ~12.5 s over 27 days / all items. A reported bucket is hour±1 pooled ≈ a
+3-hour window centred on it.
+- SQL: `internal/tools/seasonal_scan.go` (`seasonalScanSQL`).
+- **Gotcha:** same trend confound as #17 — the top of the list will contain items that
+  are simply trending across the window. That is exactly what the directive's
+  falsification step is for; the tool meta says so.
+- **→ tool:** `seasonal_scan(min_avg_vol5m, min_price, min_obs, members?, limit)`
+
+### 19. Volume z-score — `volume_zscore`
+**Answers:** is this item's volume RIGHT NOW abnormal vs its own baseline (archetype-V
+trigger)? Current-window volume (default 1h) vs hourly-volume baseline: `same_how` =
+this hour-of-week's history (cycle-aware, thin — n≈4 at 4 weeks), `trailing` = all
+hours of the past 7d (n≈168, cycle-blind). Requires `sd > 0`, `n ≥ min_baseline_obs`.
+`buys`/`sells` split the current window (one-sided spike = hoarding/dump; two-sided =
+event repricing); `price_move_pct` over the same window answers "did volume move
+*before* price" — the whole V edge. Validated live both modes (~11 s same_how): caught
+a genuine dump in progress (Antipoison(2): 424 sells vs baseline 11, price −63%) and
+classic hoard patterns (Monkey nuts: 15,129 buys vs 7 sells, z≈419).
+- SQL: `internal/tools/volume_zscore.go`.
+- **Kept in sync with** the orchestrator's armed-trigger evaluation
+  (ge-orchestrator `internal/eval/source.go`) — same computation, by design.
+- **→ tool:** `volume_zscore(name_or_id?, window='1h', baseline ∈ same_how|trailing, min_baseline_obs, min_volume, limit)`
+
+### 20. Relations listing — `list_relations`
+**Answers:** what mechanical conversions exist (archetype-C universe)? Reads the
+hand-curated `item_relations` table (ge-data `init/02` + seed `init/03`: potion
+decants, GE-clerk sets, combines). Legs enriched with `name`/`buy_limit` from `items`
+at query time — ids in the seed, names never stored, so they cannot drift. `notes`
+carry skill/quest gates and NPC fees; surfacing them is mandatory (a conversion the
+player can't perform is not their edge).
+- SQL: `internal/tools/relations.go`.
+- **→ tool:** `list_relations(kind?, name_or_id?, limit=50)`
+
+### 21. Conversion quote — `combo_quote`
+**Answers:** what does relation R pay end-to-end *right now*? Buy legs fill at latest
+`low`, sell legs at latest `high` minus per-leg GE tax `LEAST(high/50, 5000000)`
+(integer division — the ingest margin formula applied to a sell leg; **not** a
+recomputation of the stored single-item `margin`, which never applies to multi-item
+conversions). Summary: `input_cost`, `output_revenue_post_tax`, `combo_margin`,
+`roi_pct`, `max_leg_age_s` (worst leg governs freshness), `min_leg_vol5m`,
+`units_bound_per_4h` = min over buy legs of `buy_limit / qty`. A null-priced leg ⇒
+`combo_margin` null with the leg named (nulls are signal). `direction=reverse` only
+for `reversible` rows (typed error `not_reversible`). Validated: Prayer potion decant
+forward/reverse round-trip prices with correct sign flip and taxes.
+- SQL: `internal/tools/combo_quote.go`.
+- **→ tool:** `combo_quote(relation_id, direction ∈ forward|reverse)`
+
+---
+
 ## From queries to tools
 
 The recurring shapes above collapse into the `ge-mcp` tool surface:
