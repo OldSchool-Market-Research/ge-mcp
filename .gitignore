@@ -1,0 +1,15 @@
+.db
+.direnv
+result*
+
+# go
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+
+.env
