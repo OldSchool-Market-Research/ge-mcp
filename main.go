@@ -34,10 +34,19 @@ func main() {
 	defer pool.Close()
 
 	s := server.NewMCPServer("ge-mcp", version, server.WithToolCapabilities(false))
+	// Evidence
 	s.AddTool(tools.NewLookupItemTool(), tools.LookupItemHandler(pool))
 	s.AddTool(tools.NewQuoteTool(), tools.QuoteHandler(pool))
+	s.AddTool(tools.NewQuotesTool(), tools.QuotesHandler(pool))
 	s.AddTool(tools.NewItemHistoryTool(), tools.ItemHistoryHandler(pool))
 	s.AddTool(tools.NewLiquidityTool(), tools.LiquidityHandler(pool))
+	// Discovery
+	s.AddTool(tools.NewTopFlipsTool(), tools.TopFlipsHandler(pool))
+	s.AddTool(tools.NewMarginZscoreTool(), tools.MarginZscoreHandler(pool))
+	s.AddTool(tools.NewMoversTool(), tools.MoversHandler(pool))
+	s.AddTool(tools.NewScreenTool(), tools.ScreenHandler(pool))
+	s.AddTool(tools.NewAlchScreenTool(), tools.AlchScreenHandler(pool))
+	s.AddTool(tools.NewSeasonalityTool(), tools.SeasonalityHandler(pool))
 
 	if err := server.ServeStdio(s); err != nil {
 		log.Fatalf("serve: %v", err)

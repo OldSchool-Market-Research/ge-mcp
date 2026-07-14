@@ -1,0 +1,96 @@
+name: Build and publish image
+
+# Version is driven by the repo-root VERSION file — the single source of truth.
+#   merge to main         -> publish :X.Y.Z, tag vX.Y.Z, then bump the patch on main
+#   push any other branch -> publish :X.Y.Z-b<short-sha> (a pre-release build)
+on:
+  push:
+    branches: ["**"]
+
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Resolve version and image tag
+        id: ver
+        run: |
+          version=$(tr -d '[:space:]' < VERSION)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            echo "is_main=true"       >> "$GITHUB_OUTPUT"
+            echo "image_tag=$version" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_main=false"                          >> "$GITHUB_OUTPUT"
+            echo "image_tag=${version}-b${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          # GHCR_PULL_TOKEN (a PAT with read:packages) is only needed by repos
+          # whose Dockerfile pulls sibling private images (ge-orchestrator).
+          password: ${{ secrets.GHCR_PULL_TOKEN != '' && secrets.GHCR_PULL_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Guard against reusing a published release tag
+        if: steps.ver.outputs.is_main == 'true'
+        run: |
+          image="${REGISTRY}/${IMAGE_NAME}:${{ steps.ver.outputs.image_tag }}"
+          if docker manifest inspect "$image" >/dev/null 2>&1; then
+            echo "::error::$image already exists — bump VERSION before merging to main."
+            exit 1
+          fi
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.ver.outputs.image_tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.ver.outputs.image_tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Tag the release in git
+        if: steps.ver.outputs.is_main == 'true'
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "v${{ steps.ver.outputs.version }}" -m "Release v${{ steps.ver.outputs.version }}"
+          git push origin "v${{ steps.ver.outputs.version }}"
+
+      - name: Bump patch version on main
+        if: steps.ver.outputs.is_main == 'true'
+        env:
+          CURRENT: ${{ steps.ver.outputs.version }}
+        run: |
+          IFS=. read -r major minor patch <<< "$CURRENT"
+          next="${major}.${minor}.$((patch + 1))"
+          printf '%s\n' "$next" > VERSION
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add VERSION
+          git commit -m "chore: release v${CURRENT}, bump to ${next} [skip ci]"
+          git push origin HEAD:main
