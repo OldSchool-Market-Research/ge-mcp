@@ -85,8 +85,9 @@ Biggest % price moves over a window (events / news). Liquidity-gated.
 One tool, **metric-tagged**, for the seven ranking lenses.
 - **Params:** `metric, window='2h', min_obs=10, limit=25`
   - `metric ∈ volatility | surge | persistence | momentum | imbalance | range_position | spread_gap`
-  - `range_position` additionally takes `min_price=50` and defaults `window='7d'`;
-    `imbalance` additionally takes `min_volume=100`.
+  - `range_position` additionally takes `min_price=50` + `min_volume=100` and defaults
+    `window='7d'` (a `range_pos` below 0 means the latest price sits *under* the band —
+    the legs use different coalesce order); `imbalance` additionally takes `min_volume=100`.
 - **Returns per row:** `obs` always, plus metric-specific:
   - `volatility` → `cv`
   - `surge` → `cur_vol, baseline_vol, surge_ratio`

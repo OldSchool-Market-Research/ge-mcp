@@ -65,6 +65,13 @@ func parseDuration(s string) (time.Duration, error) {
 	return time.Duration(n) * unit, nil
 }
 
+// sprintfSQL splices a fragment into a query. It exists to make the one
+// allowed non-bound substitution greppable: the fragment must come from a
+// closed Go-side set (sort column / metric switch), NEVER from user input.
+func sprintfSQL(query, fragment string) string {
+	return fmt.Sprintf(query, fragment)
+}
+
 // durationParam parses an optional duration argument, returning a typed
 // bad_param result on grammar violations.
 func durationParam(req mcp.CallToolRequest, key, def string) (time.Duration, *mcp.CallToolResult) {
