@@ -328,44 +328,10 @@ ORDER BY slope_gp_per_sec DESC LIMIT 25;
 Added after reviewing 26 days of accumulated data for gaps in the original surface.
 Each of these was run against prod as-is and returned sensible results.
 
-### 12. High-alch arbitrage ✅ ship this
-**Answers:** items whose GE buy cost + a nature rune is below their high-alch value —
-the classic low-risk money-maker. `items.highalch` was already returned by `lookup_item`
-but nothing *screened* on it. Uses the **high leg (insta-buy) as cost** — the
-conservative fill assumption for a bulk alch buy. Nature rune = item 561.
-```sql
-WITH nat AS (
-  SELECT high AS cost FROM prices_1m
-  WHERE item_id = 561 AND high IS NOT NULL ORDER BY ts DESC LIMIT 1
-),
-latest AS (
-  SELECT DISTINCT ON (item_id) item_id, high, high_time FROM prices_1m ORDER BY item_id, ts DESC
-),
-liq AS (
-  SELECT DISTINCT ON (item_id) item_id,
-         coalesce(high_volume,0)+coalesce(low_volume,0) AS vol5m
-  FROM prices_5m WHERE ts > now() - interval '15 min'
-  ORDER BY item_id, ts DESC
-)
-SELECT l.item_id, i.name, l.high AS buy_at, i.highalch, nat.cost AS nat_cost,
-       i.highalch - l.high - nat.cost AS alch_margin,
-       i.buy_limit, (i.highalch - l.high - nat.cost) * i.buy_limit AS profit_per_limit,
-       extract(epoch from now() - l.high_time)::int AS buy_age_s,
-       coalesce(liq.vol5m,0) AS vol5m
-FROM latest l JOIN items i USING (item_id) LEFT JOIN liq USING (item_id), nat
-WHERE i.highalch > 0 AND l.high IS NOT NULL
-  AND l.high_time > now() - interval '30 min'
-  AND i.highalch - l.high - nat.cost > 0
-  AND coalesce(liq.vol5m,0) >= 50
-ORDER BY alch_margin DESC LIMIT 25;
-```
-- **Gotchas:** throughput is capped by casts/hour (~1,200) *and* `buy_limit` per 4h —
-  `profit_per_limit` is the 4h ceiling, not gp/hr. Alching also consumes the item
-  (no GE tax on the "sell", but no resale either). Magic level requirement is the
-  agent's problem, not the query's.
-- **Validated:** 191 items profitable at time of writing; top hits (d'hide bodies,
-  dragon platelegs) are exactly the community's known alch staples — sane output.
-- **→ tool:** `alch_screen(min_volume=50, max_age='30min', limit=25)`
+### 12. High-alch arbitrage — removed
+**Removed 2026-07-14:** alching was dropped as a strategy (over-popular, weak gp/hr, and
+the "best alch right now" is trivially discoverable — no research edge). The `alch_screen`
+tool that this query backed was deleted; the number is kept so cross-references stay stable.
 
 ### 13. Order-flow imbalance — screen metric
 **Answers:** which items have sustained one-directional pressure — `high_volume` is
@@ -513,7 +479,6 @@ The recurring shapes above collapse into the `ge-mcp` tool surface:
 | `quotes` | #16 (#0 batched) | `names_or_ids[]` |
 | `lookup_item` | building block | `query, limit` (via `items_name_lower_idx`) |
 | `liquidity` | building block #2 | `name_or_id, window` |
-| `alch_screen` | #12 | `min_volume, max_age, limit` |
 | `seasonality` | #10–#11 | `dimension, name_or_id?` |
 
 #6–#9 and #13–#15 fold into a single `screen(metric, window, limit)` tool (volatility |

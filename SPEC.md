@@ -46,14 +46,15 @@ the same shape. Lock these globally:
 
 ---
 
-## 3. The tool surface (11 tools)
+## 3. The tool surface (10 tools)
 
 Split into **discovery** (cast wide, ranked candidate sets) and **evidence** (drill one
 item). Seven are the directive's; `quote` is added because the directive's falsification
 step requires per-leg freshness for a single item and no other tool returns it.
-`alch_screen`, `quotes`, and `seasonality` (plus three new `screen` metrics) were added
+`quotes` and `seasonality` (plus three new `screen` metrics) were added
 in the 2026-07-13 money-signals amendment ([QUERIES #12–#16](./QUERIES.md#money-signals-2026-07-13-amendment--all-validated-live))
-after reviewing 26 days of accumulated data.
+after reviewing 26 days of accumulated data. (`alch_screen` was also added then, and
+removed 2026-07-14 when alching was dropped as a strategy.)
 
 ### Discovery
 
@@ -101,16 +102,6 @@ One tool, **metric-tagged**, for the seven ranking lenses.
   populated.
 - **Backed by:** [QUERIES #6–9](./QUERIES.md#6-volatility-ranking--best-range-trade-candidates),
   [#13–#15](./QUERIES.md#13-order-flow-imbalance--screen-metric)
-
-#### `alch_screen`
-High-alch arbitrage: items whose insta-buy cost + a nature rune is under their
-`highalch` value. The classic low-risk money-maker; 191 items qualified at validation.
-- **Params:** `min_volume=50, max_age='30min', limit=25`
-- **Returns per row:** `buy_at, highalch, nat_cost, alch_margin, buy_limit,
-  profit_per_limit, buy_age_s, vol5m`
-- Throughput caveat carried in the tool description: capped by ~1,200 casts/hr *and*
-  `buy_limit`/4h; `profit_per_limit` is the 4h ceiling, not gp/hr.
-- **Backed by:** [QUERIES #12](./QUERIES.md#12-high-alch-arbitrage--ship-this)
 
 #### `seasonality`
 Hour-of-day / day-of-week structure in margins and volume (archetype F — unlocked

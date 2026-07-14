@@ -30,6 +30,8 @@ jobs:
         run: |
           version=$(tr -d '[:space:]' < VERSION)
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          # ghcr requires lowercase repository names; the org name is mixed-case.
+          echo "IMAGE_NAME=${IMAGE_NAME,,}" >> "$GITHUB_ENV"
           if [ "$GITHUB_REF" = "refs/heads/main" ]; then
             echo "is_main=true"       >> "$GITHUB_OUTPUT"
             echo "image_tag=$version" >> "$GITHUB_OUTPUT"
