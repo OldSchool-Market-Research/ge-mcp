@@ -45,7 +45,6 @@ func main() {
 	s.AddTool(tools.NewMarginZscoreTool(), tools.MarginZscoreHandler(pool))
 	s.AddTool(tools.NewMoversTool(), tools.MoversHandler(pool))
 	s.AddTool(tools.NewScreenTool(), tools.ScreenHandler(pool))
-	s.AddTool(tools.NewAlchScreenTool(), tools.AlchScreenHandler(pool))
 	s.AddTool(tools.NewSeasonalityTool(), tools.SeasonalityHandler(pool))
 
 	if err := server.ServeStdio(s); err != nil {
