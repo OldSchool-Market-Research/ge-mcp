@@ -260,9 +260,8 @@ GROUP BY bucket ORDER BY bucket;
 ```
 - **Gotcha:** nulls preserved (a side with no trade in a 5m block is null); only the volume
   *sums* coalesce to 0 implicitly via `sum`. Don't `COALESCE` the avg prices.
-- **Status:** columns verified against `01_schema.sql` and `prices_5m` is confirmed populated
-  (2026-06-19); a live result-shape run is still worth doing in Phase 2 when a `ge-mcp`
-  credential exists (the 1m #5 above was run live during the spike).
+- **Status:** ✅ validated live 2026-07-13 as the `ge-mcp` role via the `item_history`
+  tool (source=5m) — result shape confirmed against real `prices_5m` rows.
 - **→ tool:** `item_history(name_or_id, grain, lookback, source='5m')`.
 
 ### 6. Volatility ranking — best range-trade candidates

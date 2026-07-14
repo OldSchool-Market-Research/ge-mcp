@@ -35,6 +35,9 @@ func main() {
 
 	s := server.NewMCPServer("ge-mcp", version, server.WithToolCapabilities(false))
 	s.AddTool(tools.NewLookupItemTool(), tools.LookupItemHandler(pool))
+	s.AddTool(tools.NewQuoteTool(), tools.QuoteHandler(pool))
+	s.AddTool(tools.NewItemHistoryTool(), tools.ItemHistoryHandler(pool))
+	s.AddTool(tools.NewLiquidityTool(), tools.LiquidityHandler(pool))
 
 	if err := server.ServeStdio(s); err != nil {
 		log.Fatalf("serve: %v", err)
