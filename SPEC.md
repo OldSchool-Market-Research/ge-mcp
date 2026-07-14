@@ -46,18 +46,24 @@ the same shape. Lock these globally:
 
 ---
 
-## 3. The tool surface (8 tools)
+## 3. The tool surface (11 tools)
 
 Split into **discovery** (cast wide, ranked candidate sets) and **evidence** (drill one
 item). Seven are the directive's; `quote` is added because the directive's falsification
 step requires per-leg freshness for a single item and no other tool returns it.
+`alch_screen`, `quotes`, and `seasonality` (plus three new `screen` metrics) were added
+in the 2026-07-13 money-signals amendment ([QUERIES #12–#16](./QUERIES.md#money-signals-2026-07-13-amendment--all-validated-live))
+after reviewing 26 days of accumulated data.
 
 ### Discovery
 
 #### `top_flips`
 The fresh, liquid flip watchlist ranked by margin / ROI% / profit-per-limit.
 - **Params:** `min_volume=50, max_age='30min', members=null, sort_by='profit_per_limit', limit=25`
-  - `sort_by ∈ margin | roi_pct | profit_per_limit`
+  - `sort_by ∈ margin | roi_pct | profit_per_limit | filled_profit`
+  - `filled_profit = margin × least(buy_limit, vol5m)` — a deliberately conservative
+    fill-aware ranking: `profit_per_limit` is a 4h ceiling that ignores whether volume
+    can actually fill the limit. (2026-07-13 amendment.)
   - Default `min_volume=50` keeps the tool genuinely *liquid* (the liquidity-gate join is
     always applied); pass `min_volume=0` to loosen to a freshness-only baseline.
 - **Returns per row:** `buy_at, sell_at, margin, roi_pct, buy_limit, profit_per_limit, high_age_s, low_age_s, vol5m`
@@ -76,17 +82,44 @@ Biggest % price moves over a window (events / news). Liquidity-gated.
 - **Backed by:** [QUERIES #3](./QUERIES.md#3-movers--biggest--price-change-over-a-window)
 
 #### `screen`
-One tool, **metric-tagged**, for the four ranking lenses.
+One tool, **metric-tagged**, for the seven ranking lenses.
 - **Params:** `metric, window='2h', min_obs=10, limit=25`
-  - `metric ∈ volatility | surge | persistence | momentum`
+  - `metric ∈ volatility | surge | persistence | momentum | imbalance | range_position | spread_gap`
+  - `range_position` additionally takes `min_price=50` and defaults `window='7d'`;
+    `imbalance` additionally takes `min_volume=100`.
 - **Returns per row:** `obs` always, plus metric-specific:
   - `volatility` → `cv`
   - `surge` → `cur_vol, baseline_vol, surge_ratio`
   - `persistence` → `pct_flippable`
   - `momentum` → `slope_gp_per_sec`
+  - `imbalance` → `buys, sells, imbalance` (insta-buy vs insta-sell flow, −1…1)
+  - `range_position` → `cur_price, range_low, range_high, range_pos, range_width_pct`
+  - `spread_gap` → `cur_margin, realized_spread, spread_ratio` (post-tax vs pre-tax —
+    labelled in `meta`; high ratio = stale-print trap)
 - The response envelope names which `metric` ran so the consumer knows which columns are
   populated.
-- **Backed by:** [QUERIES #6–9](./QUERIES.md#6-volatility-ranking--best-range-trade-candidates)
+- **Backed by:** [QUERIES #6–9](./QUERIES.md#6-volatility-ranking--best-range-trade-candidates),
+  [#13–#15](./QUERIES.md#13-order-flow-imbalance--screen-metric)
+
+#### `alch_screen`
+High-alch arbitrage: items whose insta-buy cost + a nature rune is under their
+`highalch` value. The classic low-risk money-maker; 191 items qualified at validation.
+- **Params:** `min_volume=50, max_age='30min', limit=25`
+- **Returns per row:** `buy_at, highalch, nat_cost, alch_margin, buy_limit,
+  profit_per_limit, buy_age_s, vol5m`
+- Throughput caveat carried in the tool description: capped by ~1,200 casts/hr *and*
+  `buy_limit`/4h; `profit_per_limit` is the 4h ceiling, not gp/hr.
+- **Backed by:** [QUERIES #12](./QUERIES.md#12-high-alch-arbitrage--ship-this)
+
+#### `seasonality`
+Hour-of-day / day-of-week structure in margins and volume (archetype F — unlocked
+2026-07-13 on data age; raw scans, no CAGG, slow is fine per §6).
+- **Params:** `dimension ∈ hour | dow`, `name_or_id?` (optional item filter; global
+  when omitted)
+- **Returns per row:** `bucket` (hour 0–23 UTC or dow 0–6), `avg_margin, obs`
+- dow buckets have ~4 samples of each weekday per month of data — `obs` keeps the
+  confidence rules honest.
+- **Backed by:** [QUERIES #10–11](./QUERIES.md#10-hour-of-day-seasonality--unlocked)
 
 ### Evidence
 
@@ -103,6 +136,14 @@ worked example's *"both legs fresh within 6 min ✓"*.
 - **Params:** `name_or_id`
 - **Returns:** `high, high_time, high_age_s, low, low_time, low_age_s, margin, ts, vol5m`
 - **Backed by:** [QUERIES building blocks #1 + #2](./QUERIES.md#building-blocks)
+
+#### `quotes`  *(batch — the watchlist primitive)*
+`quote` for up to 25 items in one call — re-checking N candidates otherwise costs N
+round-trips. Same row shape as `quote`; unresolvable names are reported in a per-item
+`errors` list in the envelope rather than failing the whole call.
+- **Params:** `names_or_ids` (array, 1–25)
+- **Returns per row:** as `quote`
+- **Backed by:** [QUERIES #16](./QUERIES.md#16-batch-quotes) (#0 with `ANY($1)`)
 
 #### `item_history`
 OHLC / series for one item — the evidence backbone.
@@ -126,10 +167,9 @@ Summed recent 5m volume for sizing. Accepts `name_or_id` (not bare `item_id`) to
 
 ## 4. Out of scope for v1
 
-- **Seasonality** (`seasonality(dimension)` — hour-of-day / day-of-week, QUERIES #10–11).
-  Archetype F is locked until the data is old enough anyway; when it unlocks it needs a
-  **continuous aggregate** (raw decompression over weeks is too slow), i.e. a schema change
-  in `ge-data/init/`, not just a tool. Named here so it isn't forgotten.
+- ~~**Seasonality**~~ — **moved in-scope 2026-07-13**: the data-age bar (~3–4 weeks) has
+  been reached, and §6 already resolved that raw scans are acceptable (no CAGG, no schema
+  change). Now specced as the `seasonality` tool in §3.
 - **Combo / related items** (set-vs-components, raw-vs-processed). No relationship data
   exists in `items`, so the directive's combo paragraph is currently unbacked. Either cut
   it from v1 or add a `quotes([name_or_id])` batch tool *and* accept there is no

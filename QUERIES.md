@@ -323,14 +323,163 @@ ORDER BY slope_gp_per_sec DESC LIMIT 25;
 
 ---
 
-## Needs more history
+## Money signals (2026-07-13 amendment — all validated live)
 
-The data is **forward-only and young** (grows from when polling began). These are
-correct but only meaningful once enough history accumulates — and they're the prime
-candidates for **continuous aggregates** (let Timescale maintain a rollup incrementally
-instead of rescanning raw, compressed rows).
+Added after reviewing 26 days of accumulated data for gaps in the original surface.
+Each of these was run against prod as-is and returned sensible results.
 
-### 10. Hour-of-day seasonality — *needs ~1 week*
+### 12. High-alch arbitrage ✅ ship this
+**Answers:** items whose GE buy cost + a nature rune is below their high-alch value —
+the classic low-risk money-maker. `items.highalch` was already returned by `lookup_item`
+but nothing *screened* on it. Uses the **high leg (insta-buy) as cost** — the
+conservative fill assumption for a bulk alch buy. Nature rune = item 561.
+```sql
+WITH nat AS (
+  SELECT high AS cost FROM prices_1m
+  WHERE item_id = 561 AND high IS NOT NULL ORDER BY ts DESC LIMIT 1
+),
+latest AS (
+  SELECT DISTINCT ON (item_id) item_id, high, high_time FROM prices_1m ORDER BY item_id, ts DESC
+),
+liq AS (
+  SELECT DISTINCT ON (item_id) item_id,
+         coalesce(high_volume,0)+coalesce(low_volume,0) AS vol5m
+  FROM prices_5m WHERE ts > now() - interval '15 min'
+  ORDER BY item_id, ts DESC
+)
+SELECT l.item_id, i.name, l.high AS buy_at, i.highalch, nat.cost AS nat_cost,
+       i.highalch - l.high - nat.cost AS alch_margin,
+       i.buy_limit, (i.highalch - l.high - nat.cost) * i.buy_limit AS profit_per_limit,
+       extract(epoch from now() - l.high_time)::int AS buy_age_s,
+       coalesce(liq.vol5m,0) AS vol5m
+FROM latest l JOIN items i USING (item_id) LEFT JOIN liq USING (item_id), nat
+WHERE i.highalch > 0 AND l.high IS NOT NULL
+  AND l.high_time > now() - interval '30 min'
+  AND i.highalch - l.high - nat.cost > 0
+  AND coalesce(liq.vol5m,0) >= 50
+ORDER BY alch_margin DESC LIMIT 25;
+```
+- **Gotchas:** throughput is capped by casts/hour (~1,200) *and* `buy_limit` per 4h —
+  `profit_per_limit` is the 4h ceiling, not gp/hr. Alching also consumes the item
+  (no GE tax on the "sell", but no resale either). Magic level requirement is the
+  agent's problem, not the query's.
+- **Validated:** 191 items profitable at time of writing; top hits (d'hide bodies,
+  dragon platelegs) are exactly the community's known alch staples — sane output.
+- **→ tool:** `alch_screen(min_volume=50, max_age='30min', limit=25)`
+
+### 13. Order-flow imbalance — screen metric
+**Answers:** which items have sustained one-directional pressure — `high_volume` is
+insta-buys (demand), `low_volume` is insta-sells (supply). A 7d probe on Twisted bow
+showed hourly imbalance vs next-hour move correlating at **−0.165 (n=169)** — weakly
+*contrarian*. Not a proven signal either way: expose the evidence, let the directive
+loop falsify it per-item.
+```sql
+SELECT p.item_id, i.name,
+       coalesce(sum(high_volume),0)::bigint AS buys,
+       coalesce(sum(low_volume),0)::bigint  AS sells,
+       round((coalesce(sum(high_volume),0)-coalesce(sum(low_volume),0))::numeric
+             / nullif(coalesce(sum(high_volume),0)+coalesce(sum(low_volume),0),0), 3) AS imbalance,
+       count(*) AS obs
+FROM prices_5m p JOIN items i USING (item_id)
+WHERE p.ts > now() - interval '2 hours'
+GROUP BY p.item_id, i.name
+HAVING coalesce(sum(high_volume),0)+coalesce(sum(low_volume),0) >= 100 AND count(*) >= 10
+ORDER BY abs((coalesce(sum(high_volume),0)-coalesce(sum(low_volume),0))::numeric
+             / nullif(coalesce(sum(high_volume),0)+coalesce(sum(low_volume),0),0)) DESC
+LIMIT 25;
+```
+- **Gotcha:** without the `count(*) >= min_obs` gate, single-bucket items pin to ±1.0
+  and drown the list (found during validation).
+- **→ tool:** `screen(metric='imbalance', window, min_obs, limit)` (+ a `min_volume` knob)
+
+### 14. Range position — screen metric
+**Answers:** where the current price sits inside its N-day band (0 = at range low,
+1 = at range high). The actionable half of a range trade: `volatility` (#6) finds wide
+bands, this finds *entries* — high-cv items currently near their floor.
+```sql
+WITH r AS (
+  SELECT item_id,
+         min(coalesce(low,high))  AS range_low,
+         max(coalesce(high,low))  AS range_high,
+         count(*) AS obs
+  FROM prices_1m
+  WHERE ts > now() - interval '7 days'
+  GROUP BY item_id
+  HAVING count(*) >= 50
+),
+latest AS (
+  SELECT DISTINCT ON (item_id) item_id, coalesce(high,low) AS px, ts
+  FROM prices_1m ORDER BY item_id, ts DESC
+),
+liq AS (
+  SELECT DISTINCT ON (item_id) item_id,
+         coalesce(high_volume,0)+coalesce(low_volume,0) AS vol5m
+  FROM prices_5m WHERE ts > now() - interval '15 min'
+  ORDER BY item_id, ts DESC
+)
+SELECT l.item_id, i.name, l.px AS cur_price, r.range_low, r.range_high,
+       round((l.px - r.range_low)::numeric / nullif(r.range_high - r.range_low, 0), 3) AS range_pos,
+       round((r.range_high - r.range_low)::numeric / nullif(r.range_low,0) * 100, 1) AS range_width_pct,
+       r.obs, liq.vol5m
+FROM latest l JOIN r USING (item_id) JOIN items i USING (item_id) JOIN liq USING (item_id)
+WHERE l.ts > now() - interval '30 min'
+  AND l.px > 50                                                     -- min_price floor
+  AND (r.range_high - r.range_low)::numeric / nullif(r.range_low,0) > 0.05
+  AND liq.vol5m >= 100
+ORDER BY range_pos ASC
+LIMIT 25;
+```
+- **Gotchas:** needs the `min_price` floor (penny items pin to 0.000 — 1gp can't go
+  lower; found during validation) and the range-width gate (a 5% band isn't worth
+  trading). Uses the `coalesce(high,low)` proxy — same spread-bounce caveat as #6/#9.
+- **→ tool:** `screen(metric='range_position', window='7d', min_price=50, min_obs, limit)`
+
+### 15. Spread gap — instantaneous margin vs realized spread — screen metric
+**Answers:** items whose *current* 1m margin is a large multiple of what the spread
+*actually averaged* (5m block averages) while volume flowed — the stale-print trap that
+freshness gates alone don't catch. High ratio = the quoted margin probably isn't fillable.
+```sql
+WITH rs AS (
+  SELECT item_id, avg(avg_high_price - avg_low_price)::bigint AS realized_spread, count(*) AS obs
+  FROM prices_5m
+  WHERE ts > now() - interval '2 hours'
+    AND avg_high_price IS NOT NULL AND avg_low_price IS NOT NULL
+  GROUP BY item_id HAVING count(*) >= 10
+),
+latest AS (
+  SELECT DISTINCT ON (item_id) item_id, margin, high_time, low_time
+  FROM prices_1m ORDER BY item_id, ts DESC
+)
+SELECT l.item_id, i.name, l.margin AS cur_margin, rs.realized_spread,
+       round(l.margin::numeric / nullif(rs.realized_spread,0), 2) AS spread_ratio, rs.obs
+FROM latest l JOIN rs USING (item_id) JOIN items i USING (item_id)
+WHERE l.margin > 0 AND rs.realized_spread > 0
+  AND l.high_time > now() - interval '30 min' AND l.low_time > now() - interval '30 min'
+ORDER BY spread_ratio DESC LIMIT 25;
+```
+- **Gotcha:** `cur_margin` is **post-tax**, `realized_spread` is **pre-tax** (5m has no
+  margin column and we never recompute tax — SPIKE decision #2). The ratio is therefore
+  slightly *understated*; fine for a trap detector, labelled in `meta`. Sort ascending
+  to instead find margins *narrower* than realized — spreads likely to widen back.
+- **Validated:** top hit was Old school bond at 23.45× (642k quoted vs 27k realized) —
+  precisely the artifact class this exists to expose.
+- **→ tool:** `screen(metric='spread_gap', window, min_obs, limit)`
+
+### 16. Batch quotes
+**Answers:** #0 for a watchlist in one call — re-checking N candidates currently costs
+N round-trips. Same SQL as #0 with `item_id = ANY($1)` in both CTEs (validated live).
+- **→ tool:** `quotes(names_or_ids[], limit≤25)`
+
+---
+
+## Seasonality (unlocked 2026-07-13)
+
+Originally parked under "needs more history" — **26 days have now accumulated**, past
+the ~3–4 week bar for both dimensions. Validated live: hour-of-day shows real structure
+(UTC hour 6 avg margin ≈ +1116 vs hour 11 ≈ −196, ~700k obs per bucket). Raw scans are
+acceptable per SPEC §6 (slow is fine; no CAGG needed).
+
+### 10. Hour-of-day seasonality ✅ unlocked
 When do spreads widen / volume peak (player-population cycle)?
 ```sql
 SELECT extract(hour from ts) AS hour_utc, round(avg(margin)) AS avg_margin, count(*) AS obs
@@ -339,8 +488,13 @@ WHERE margin IS NOT NULL
 GROUP BY hour_utc ORDER BY hour_utc;
 ```
 
-### 11. Day-of-week effects — *needs ~3–4 weeks*
-Same shape with `extract(dow from ts)`. Weekend vs weekday liquidity/spread.
+### 11. Day-of-week effects ✅ unlocked (just — keep `obs` in view)
+Same shape with `extract(dow from ts)`. Weekend vs weekday liquidity/spread. At ~26
+days each dow bucket has only ~4 samples of that weekday — real but young; the `obs`
+column keeps the confidence rules honest.
+
+- **→ tool:** `seasonality(dimension ∈ hour|dow, name_or_id?)` — optional item filter;
+  global when omitted.
 
 ---
 
@@ -356,12 +510,16 @@ The recurring shapes above collapse into the `ge-mcp` tool surface:
 | `screen` | #6–#9 | `metric, window, min_obs, limit` |
 | `item_history` | #5 (+gapfill block) | `name_or_id, grain, lookback, source` |
 | `quote` | #0 (building blocks #1+#2) | `name_or_id` |
+| `quotes` | #16 (#0 batched) | `names_or_ids[]` |
 | `lookup_item` | building block | `query, limit` (via `items_name_lower_idx`) |
 | `liquidity` | building block #2 | `name_or_id, window` |
+| `alch_screen` | #12 | `min_volume, max_age, limit` |
+| `seasonality` | #10–#11 | `dimension, name_or_id?` |
 
-#6–#9 fold into a single `screen(metric, window, limit)` tool (volatility | surge |
-persistence | momentum) rather than four tools, unless the agent uses them distinctly.
-Revisit once the directive runs in SPIKE.md show which actually get used.
+#6–#9 and #13–#15 fold into a single `screen(metric, window, limit)` tool (volatility |
+surge | persistence | momentum | imbalance | range_position | spread_gap) rather than
+seven tools, unless the agent uses them distinctly. Revisit once the directive runs in
+SPIKE.md show which actually get used.
 
 The full tool surface — params, return contracts, the one read-only connection, and the
 decisions still open — lives in [SPEC.md](./SPEC.md). Two changes there vs. the original
