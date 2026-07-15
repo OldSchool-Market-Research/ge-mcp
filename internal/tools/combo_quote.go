@@ -96,6 +96,9 @@ func ComboQuoteHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 			return mcp.NewToolResultError(envelope.ErrorJSON("relation_not_found", fmt.Sprintf("no relation with id %d (see list_relations)", relationID))), nil
 		}
 		if err != nil {
+			if errResult := relationsUnavailable(err); errResult != nil {
+				return errResult, nil
+			}
 			return nil, err
 		}
 		if direction == "reverse" && !reversible {

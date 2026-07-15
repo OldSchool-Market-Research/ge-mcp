@@ -3,7 +3,9 @@ package tools
 import (
 	"context"
 	"encoding/json"
+	"errors"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
@@ -35,6 +37,19 @@ WHERE ($1::text IS NULL OR r.kind = $1)
                                   WHERE (l->>'item_id')::int = $2::int))
 ORDER BY r.kind, r.name
 LIMIT $3`
+
+// relationsUnavailable converts a missing item_relations table (42P01) into a
+// typed tool error instead of a fatal internal one: the table ships as a
+// manual DDL apply separate from this binary, and a run must be able to note
+// "archetype C unavailable" and continue rather than die on the first call.
+func relationsUnavailable(err error) *mcp.CallToolResult {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
+		return mcp.NewToolResultError(envelope.ErrorJSON("relations_unavailable",
+			"the item_relations table is not present in this database — archetype C is unavailable; note it and continue with the other archetypes"))
+	}
+	return nil
+}
 
 type relationLeg struct {
 	ItemID   int    `json:"item_id"`
@@ -94,6 +109,9 @@ func ListRelationsHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 
 		rows, err := pool.Query(ctx, listRelationsSQL, kind, itemID, limit)
 		if err != nil {
+			if errResult := relationsUnavailable(err); errResult != nil {
+				return errResult, nil
+			}
 			return nil, err
 		}
 		defer rows.Close()
