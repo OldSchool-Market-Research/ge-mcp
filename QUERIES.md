@@ -151,9 +151,17 @@ LIMIT 25;
 - **Knobs:** freshness window; sort key (`margin` raw / `roi_pct` capital-efficiency /
   `profit_per_limit` whale mode); the liquidity gate (join building-block #2,
   `WHERE vol5m > min_volume`) for "can I actually fill this size".
-- **→ tool:** `top_flips(min_volume=50, max_age, members?, sort_by, limit)` — the tool
-  **always** applies the building-block #2 liquidity join (`vol5m > min_volume`); default
-  `min_volume=50` so it's liquid out of the box, `min_volume=0` loosens to freshness-only.
+- **→ tool:** `top_flips(min_volume=50, min_vol24h=0, min_price=0, max_age, members?, sort_by, limit)`
+  — the tool **always** applies the building-block #2 liquidity join (`vol5m > min_volume`);
+  default `min_volume=50` so it's liquid out of the box, `min_volume=0` loosens to
+  freshness-only.
+- **2026-07-18 flips-first amendment:** the tool adds a `vol24` CTE
+  (`sum(high_volume)+sum(low_volume)` over 24h per item, the summed shape of building
+  block #2), two gates on it (`min_vol24h` in units, `min_price` on the buy leg), and a
+  `gp_day` column `margin * least(buy_limit*6, floor(vol24h*0.15))` — the absolute daily
+  capacity ceiling (six 4h buy-limit cycles bounded by 15% volume participation), also a
+  sort key. Lane F (volume flips) = `min_vol24h=100000`; lane B (high-value flips) =
+  `min_price=10000000, min_vol24h=200, sort_by=margin`.
 
 ---
 
@@ -503,6 +511,12 @@ amplitude). ~12.5 s over 27 days / all items. A reported bucket is hour±1 poole
 - **Gotcha:** same trend confound as #17 — the top of the list will contain items that
   are simply trending across the window. That is exactly what the directive's
   falsification step is for; the tool meta says so.
+- **2026-07-18 flips-first amendment:** output adds `gp_cycle` =
+  `(dear_idx − cheap_idx) × mean_mid × least(buy_limit, floor(avg_vol5m × 36 × 0.15))`
+  — the pre-tax absolute-gp ceiling of one cheap→dear cycle (fill bounded by buy limit
+  and a 15% share of the ~3h pooled-bucket volume). Ranking stays `amplitude_pct` —
+  since the redesign this tool is timing/qualification evidence, not a strategy source —
+  but amplitude is never presented without its gp scale (the sweetcorn guard).
 - **→ tool:** `seasonal_scan(min_avg_vol5m, min_price, min_obs, members?, limit)`
 
 ### 19. Volume z-score — `volume_zscore`
@@ -552,7 +566,7 @@ The recurring shapes above collapse into the `ge-mcp` tool surface:
 
 | Tool | Backed by | Params |
 |---|---|---|
-| `top_flips` | #2 | `min_volume, max_age, members?, sort_by, limit` |
+| `top_flips` | #2 | `min_volume, min_vol24h, min_price, max_age, members?, sort_by, limit` |
 | `movers` | #3 | `window, min_price, min_volume, limit` |
 | `margin_zscore` | #4 | `baseline_window, min_samples, max_age, limit` |
 | `screen` | #6–#9 | `metric, window, min_obs, limit` |

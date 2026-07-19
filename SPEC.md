@@ -62,15 +62,22 @@ a strategy.) The 2026-07-14 archetype re-architecture (S/V/C/U/H) extended
 ### Discovery
 
 #### `top_flips`
-The fresh, liquid flip watchlist ranked by margin / ROI% / profit-per-limit.
-- **Params:** `min_volume=50, max_age='30min', members=null, sort_by='profit_per_limit', limit=25`
-  - `sort_by ∈ margin | roi_pct | profit_per_limit | filled_profit`
+The fresh, liquid flip watchlist ranked by margin / ROI% / profit-per-limit / gp-per-day.
+The discovery primitive behind the two flip lanes (2026-07-18 flips-first redesign).
+- **Params:** `min_volume=50, min_vol24h=0, min_price=0, max_age='30min', members=null, sort_by='profit_per_limit', limit=25`
+  - `sort_by ∈ margin | roi_pct | profit_per_limit | filled_profit | gp_day`
   - `filled_profit = margin × least(buy_limit, vol5m)` — a deliberately conservative
     fill-aware ranking: `profit_per_limit` is a 4h ceiling that ignores whether volume
     can actually fill the limit. (2026-07-13 amendment.)
+  - `gp_day = margin × least(buy_limit × 6, floor(vol24h × 0.15))` — the absolute daily
+    capacity ceiling: six 4h buy-limit cycles bounded by a 15% participation share of
+    real 24h volume. The redesign's universal "is this worth anyone's time" number.
+  - `min_vol24h` gates on summed 24h volume (units); `min_price` gates on the buy leg.
+  - **Lane F (volume flips):** `min_vol24h=100000, max_age='30min'..'60min', sort_by=profit_per_limit`.
+  - **Lane B (high-value flips):** `min_price=10000000, min_vol24h=200, max_age='30min', sort_by=margin`.
   - Default `min_volume=50` keeps the tool genuinely *liquid* (the liquidity-gate join is
     always applied); pass `min_volume=0` to loosen to a freshness-only baseline.
-- **Returns per row:** `buy_at, sell_at, margin, roi_pct, buy_limit, profit_per_limit, high_age_s, low_age_s, vol5m`
+- **Returns per row:** `buy_at, sell_at, margin, roi_pct, buy_limit, profit_per_limit, filled_profit, gp_day, high_age_s, low_age_s, vol5m, vol24h`
 - **Backed by:** [QUERIES #2](./QUERIES.md#2-real-flips--fresh-liquid-ranked-by-profit-per-limit--ship-this)
 
 #### `margin_zscore`
@@ -122,13 +129,16 @@ see #18's normalization; that's `seasonal_scan`). Raw scans, slow is fine per §
 - **Backed by:** [QUERIES #10–11](./QUERIES.md#10-hour-of-day-seasonality--unlocked),
   [#17](./QUERIES.md#17-hour-of-week-seasonality-price-level--smoothed--seasonality-v2)
 
-#### `seasonal_scan`  *(archetype S discovery)*
-Rank ALL items by hour-of-week price amplitude (max pooled `price_index` − min) so S
-candidates surface in one call. ~12s full-history scan.
+#### `seasonal_scan`  *(seasonal-structure evidence; was archetype-S discovery)*
+Rank ALL items by hour-of-week price amplitude (max pooled `price_index` − min) so
+seasonal structure surfaces in one call. ~12s full-history scan. Since the 2026-07-18
+flips-first redesign this is qualification/timing evidence, not a strategy source; the
+`gp_cycle` column exists so amplitude can never be read without its absolute-gp scale.
 - **Params:** `min_avg_vol5m=500, min_price=250, min_obs=9, members?, limit=25`
 - **Returns per row:** `item_id, name, buy_limit, members, amplitude_pct,
   cheap_bucket, cheap_idx, dear_bucket, dear_idx, min_bucket_obs, avg_vol5m,
-  mean_price` (buckets are hour±1 pooled ≈ 3h windows)
+  mean_price, gp_cycle` (buckets are hour±1 pooled ≈ 3h windows;
+  `gp_cycle = amplitude_gp × least(buy_limit, 15% of ~3h bucket volume)`, pre-tax ceiling)
 - **Backed by:** [QUERIES #18](./QUERIES.md#18-hour-of-week-amplitude-scan--seasonal_scan)
 
 #### `volume_zscore`  *(archetype V trigger)*

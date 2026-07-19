@@ -236,3 +236,24 @@ real usage.
 
 Open only after Phase 4 (real-usage signal): whether to split `screen`. Everything else is
 final — the §9 plan is ready to execute.
+
+---
+
+## 11. Flips-first amendment (2026-07-18)
+
+The sweetcorn incident (ge-agent run 123: a 423gp strategy shipped off a 103% amplitude
+ranking) established that **ratio rankings without an absolute-gp column are a footgun**:
+every discovery surface must expose what an opportunity is worth in gp at fillable size,
+not only how large it is relative to itself.
+
+1. **`top_flips` is the discovery primitive for the two flip lanes** (volume flips:
+   `min_vol24h=100000`; high-value flips: `min_price=10000000, min_vol24h=200,
+   sort_by=margin`). It gains a `vol24` CTE (24h summed volume), `min_vol24h`/`min_price`
+   gates, and a `gp_day` capacity column/sort
+   (`margin × least(buy_limit×6, floor(vol24h×0.15))`).
+2. **`seasonal_scan` demoted to evidence.** Ranking stays `amplitude_pct` but each row
+   now carries `gp_cycle` (amplitude in gp × fillable units) so a ratio is never
+   presented without its absolute scale.
+3. The capacity constants (6 cycles/day, 15% participation) are deliberately simple
+   ceilings, documented in each tool's meta; the paper-trading evaluator owns the
+   honest haircut.

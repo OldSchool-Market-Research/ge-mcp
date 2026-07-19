@@ -73,6 +73,8 @@ SELECT a.item_id, i.name, i.buy_limit, i.members,
        a.min_bucket_obs,
        round(s.tot_vol::numeric / s.tot_n)::bigint AS avg_vol5m,
        round(s.mean_mid::numeric)::bigint AS mean_price,
+       round(((a.dear_idx - a.cheap_idx) * s.mean_mid
+              * least(i.buy_limit, floor((s.tot_vol::numeric / s.tot_n) * 36 * 0.15)))::numeric)::bigint AS gp_cycle,
        s.from_ts, s.to_ts
 FROM agg a
 JOIN item_stats s USING (item_id)
@@ -94,6 +96,7 @@ type seasonalScanRow struct {
 	MinBucketObs int64   `json:"min_bucket_obs"`
 	AvgVol5m     int64   `json:"avg_vol5m"`
 	MeanPrice    int64   `json:"mean_price"`
+	GpCycle      *int64  `json:"gp_cycle"`
 }
 
 func NewSeasonalScanTool() mcp.Tool {
@@ -143,7 +146,7 @@ func SeasonalScanHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 			var r seasonalScanRow
 			if err := rows.Scan(&r.ItemID, &r.Name, &r.BuyLimit, &r.Members,
 				&r.AmplitudePct, &r.CheapBucket, &r.CheapIdx, &r.DearBucket, &r.DearIdx,
-				&r.MinBucketObs, &r.AvgVol5m, &r.MeanPrice, &scanFrom, &scanTo); err != nil {
+				&r.MinBucketObs, &r.AvgVol5m, &r.MeanPrice, &r.GpCycle, &scanFrom, &scanTo); err != nil {
 				rows.Close()
 				return nil, err
 			}
@@ -161,6 +164,7 @@ func SeasonalScanHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 		env.Meta = map[string]any{
 			"bucket_convention": "dow*24+hour UTC, dow 0=Sunday; each bucket hour±1 pooled (≈3h window)",
 			"note":              "amplitude below ~3% rarely survives the 2% sell tax + spread crossing; trend-vs-seasonality falsification is mandatory (see tool description)",
+			"gp_cycle_basis":    "pre-tax ceiling per cheap->dear cycle: amplitude in gp x min(buy_limit, 15% of the ~3h bucket window volume). A big amplitude_pct with a tiny gp_cycle is a trap — judge candidates by gp, not ratio",
 		}
 		if scanFrom != nil && scanTo != nil {
 			env.DataWindow = &envelope.Window{From: *scanFrom, To: *scanTo}
