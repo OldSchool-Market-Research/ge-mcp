@@ -558,6 +558,54 @@ forward/reverse round-trip prices with correct sign flip and taxes.
 - SQL: `internal/tools/combo_quote.go`.
 - **→ tool:** `combo_quote(relation_id, direction ∈ forward|reverse)`
 
+### 22. Margin persistence + round-trip frequency — the spike-vs-standing-spread laterals
+**Answers:** is this margin a standing spread or a momentary spike? The 2026-08-01
+persistence amendment: the 14-day paper record showed the fleet's median shipped F
+margin at 40% of its claim 15 minutes after ship and 8% at 45 minutes — persistence
+was demanded by the directive but computed by nobody, so the model eyeballed OHLC.
+Two `LEFT JOIN LATERAL`s appended to `top_flips` (after the sort + `LIMIT`, so at most
+`limit` per-item scans) and to `quote`/`quotes`:
+
+```sql
+-- margin_persistence_24h: hours (of a fixed 24) whose hourly avg post-tax spread
+-- held >= 50% of the current margin. Unobserved hours count as not-persistent —
+-- an unobserved spread is not a demonstrated spread; obs_hours carries the
+-- both-sides sample count. Tax matches ingest: least(floor(high/50), 5000000).
+LEFT JOIN LATERAL (
+  SELECT count(*) FILTER (WHERE h.hi - least(floor(h.hi/50), 5000000) - h.lo >= b.margin * 0.5) AS ok_hours,
+         count(*) AS obs_hours
+  FROM (
+    SELECT avg(avg_high_price) FILTER (WHERE high_volume > 0) AS hi,
+           avg(avg_low_price)  FILTER (WHERE low_volume  > 0) AS lo
+    FROM prices_5m
+    WHERE item_id = b.item_id AND ts > now() - interval '24 hours'
+    GROUP BY date_trunc('hour', ts)
+  ) h
+  WHERE h.hi IS NOT NULL AND h.lo IS NOT NULL
+) persist ON true
+-- roundtrips_24h: 30-min buckets where BOTH sides printed at a positive post-tax
+-- spread — how often a profitable round trip actually happened. Dead-book detector.
+LEFT JOIN LATERAL (
+  SELECT count(*) AS roundtrips FROM (
+    SELECT 1
+    FROM prices_5m
+    WHERE item_id = b.item_id AND ts > now() - interval '24 hours'
+    GROUP BY date_trunc('hour', ts), (extract(minute from ts)::int / 30)
+    HAVING sum(high_volume) > 0 AND sum(low_volume) > 0
+       AND avg(avg_high_price) FILTER (WHERE high_volume > 0)
+           - least(floor(avg(avg_high_price) FILTER (WHERE high_volume > 0) / 50), 5000000)
+           - avg(avg_low_price) FILTER (WHERE low_volume > 0) > 0
+  ) w
+) rt ON true
+```
+
+Validated 2026-08-01 against a synthetic 24h series (12 wide-spread hours, 6 one-sided
+hours, 6 negative-spread hours → `0.50 / 18 / 24` exactly; a fresh quote with no 5m
+history → `0 / 0 / 0`). `margin_persistence_24h` is null when the current margin is
+null: no reference spread, no persistence claim.
+- SQL: `internal/tools/persistence.go` (shared by the three tools).
+- **→ fields on:** `top_flips`, `quote`, `quotes`
+
 ---
 
 ## From queries to tools

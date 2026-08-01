@@ -2,6 +2,7 @@ package tools
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -17,8 +18,10 @@ import (
 // gp_day is the absolute-capacity metric: post-tax margin x what a day can
 // actually fill — min(buy_limit x 6 four-hour cycles, 15% of 24h volume).
 // The sort column is switched in Go from a closed set — never interpolated
-// from input.
-const topFlipsSQL = `
+// from input. The persistence laterals run AFTER the sort + limit, so their
+// per-item 24h scans touch at most `limit` items (%[1]s sorts inside base,
+// %[2]s re-sorts the joined rows by the same output alias).
+var topFlipsSQL = `
 WITH latest AS (
   SELECT DISTINCT ON (item_id) item_id, ts, high, high_time, low, low_time, margin
   FROM prices_1m ORDER BY item_id, ts DESC
@@ -34,31 +37,38 @@ vol24 AS (
          coalesce(sum(high_volume),0)+coalesce(sum(low_volume),0) AS vol24h
   FROM prices_5m WHERE ts > now() - interval '24 hours'
   GROUP BY item_id
+),
+base AS (
+  SELECT l.item_id, i.name, l.ts,
+         l.low  AS buy_at,
+         l.high AS sell_at,
+         l.margin,
+         round(l.margin::numeric / nullif(l.low,0) * 100, 2)::float8 AS roi_pct,
+         i.buy_limit,
+         l.margin * i.buy_limit AS profit_per_limit,
+         l.margin * least(i.buy_limit, coalesce(liq.vol5m,0)) AS filled_profit,
+         l.margin * least(i.buy_limit * 6, floor(coalesce(v.vol24h,0) * 0.15)::bigint) AS gp_day,
+         extract(epoch from now() - l.high_time)::int AS high_age_s,
+         extract(epoch from now() - l.low_time)::int  AS low_age_s,
+         coalesce(liq.vol5m,0) AS vol5m,
+         coalesce(v.vol24h,0) AS vol24h
+  FROM latest l JOIN items i USING (item_id)
+       LEFT JOIN liq USING (item_id)
+       LEFT JOIN vol24 v USING (item_id)
+  WHERE l.margin > 0
+    AND l.high_time > $1 AND l.low_time > $1
+    AND coalesce(liq.vol5m,0) >= $2
+    AND coalesce(v.vol24h,0) >= $3
+    AND l.low >= $4
+    AND ($5::boolean IS NULL OR i.members = $5)
+  ORDER BY %[1]s DESC NULLS LAST
+  LIMIT $6
 )
-SELECT l.item_id, i.name, l.ts,
-       l.low  AS buy_at,
-       l.high AS sell_at,
-       l.margin,
-       round(l.margin::numeric / nullif(l.low,0) * 100, 2)::float8 AS roi_pct,
-       i.buy_limit,
-       l.margin * i.buy_limit AS profit_per_limit,
-       l.margin * least(i.buy_limit, coalesce(liq.vol5m,0)) AS filled_profit,
-       l.margin * least(i.buy_limit * 6, floor(coalesce(v.vol24h,0) * 0.15)::bigint) AS gp_day,
-       extract(epoch from now() - l.high_time)::int AS high_age_s,
-       extract(epoch from now() - l.low_time)::int  AS low_age_s,
-       coalesce(liq.vol5m,0) AS vol5m,
-       coalesce(v.vol24h,0) AS vol24h
-FROM latest l JOIN items i USING (item_id)
-     LEFT JOIN liq USING (item_id)
-     LEFT JOIN vol24 v USING (item_id)
-WHERE l.margin > 0
-  AND l.high_time > $1 AND l.low_time > $1
-  AND coalesce(liq.vol5m,0) >= $2
-  AND coalesce(v.vol24h,0) >= $3
-  AND l.low >= $4
-  AND ($5::boolean IS NULL OR i.members = $5)
-ORDER BY %s DESC NULLS LAST
-LIMIT $6`
+SELECT b.*,
+       ` + persistenceSelect("b.margin") + `
+FROM base b
+` + persistenceJoins("b.item_id", "b.margin") + `
+ORDER BY %[2]s DESC NULLS LAST`
 
 var topFlipsSorts = map[string]string{
 	"margin":           "l.margin",
@@ -84,11 +94,15 @@ type flipRow struct {
 	LowAgeS        int       `json:"low_age_s"`
 	Vol5m          int64     `json:"vol5m"`
 	Vol24h         int64     `json:"vol24h"`
+
+	MarginPersistence24h *float64 `json:"margin_persistence_24h"`
+	PersistObsHours      int      `json:"persist_obs_hours"`
+	Roundtrips24h        int      `json:"roundtrips_24h"`
 }
 
 func NewTopFlipsTool() mcp.Tool {
 	return mcp.NewTool("top_flips",
-		mcp.WithDescription("The fresh, liquid flip watchlist: latest post-tax margin with both legs fresh, always liquidity-gated (min_volume=0 to loosen). profit_per_limit is the 4h ceiling (margin x buy_limit); filled_profit is the conservative instant variant (margin x least(buy_limit, vol5m)); gp_day is the absolute daily capacity (margin x min(buy_limit x 6, 15% of vol24h)). Lane screens: volume flips = min_vol24h=100000; high-value flips = min_price=10000000, min_vol24h=200, sort_by=margin."),
+		mcp.WithDescription("The fresh, liquid flip watchlist: latest post-tax margin with both legs fresh, always liquidity-gated (min_volume=0 to loosen). profit_per_limit is the 4h ceiling (margin x buy_limit); filled_profit is the conservative instant variant (margin x least(buy_limit, vol5m)); gp_day is the absolute daily capacity (margin x min(buy_limit x 6, 15% of vol24h)). margin_persistence_24h is the share of the last 24 hours whose hourly avg post-tax spread held >= 50% of the current margin — a momentary spike scores near 0, a real standing spread scores high; roundtrips_24h counts the 30-min windows today where both sides actually printed at a positive post-tax spread (a quoted spread on a dead book scores 0). Lane screens: volume flips = min_vol24h=100000; high-value flips = min_price=10000000, min_vol24h=200, sort_by=margin."),
 		mcp.WithString("max_age", mcp.Description("Both-leg freshness gate, e.g. 30min / 5m (default 30min)")),
 		mcp.WithNumber("min_volume", mcp.Description("Latest-5m-volume liquidity gate (default 50; 0 = freshness-only)")),
 		mcp.WithNumber("min_vol24h", mcp.Description("24h summed volume gate in units (default 0 = off)")),
@@ -134,7 +148,10 @@ func TopFlipsHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 		}
 
 		cutoff := time.Now().UTC().Add(-maxAge)
-		rows, err := pool.Query(ctx, sprintfSQL(topFlipsSQL, sortCol), cutoff, minVolume, minVol24h, minPrice, members, limit)
+		// Both fragments come from the closed topFlipsSorts set: sortCol for
+		// the base CTE, the output alias (the map key itself) re-sorting the
+		// lateral-joined rows.
+		rows, err := pool.Query(ctx, fmt.Sprintf(topFlipsSQL, sortCol, "b."+sortBy), cutoff, minVolume, minVol24h, minPrice, members, limit)
 		if err != nil {
 			return nil, err
 		}
@@ -145,7 +162,8 @@ func TopFlipsHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 			var r flipRow
 			if err := rows.Scan(&r.ItemID, &r.Name, &r.Ts, &r.BuyAt, &r.SellAt, &r.Margin,
 				&r.RoiPct, &r.BuyLimit, &r.ProfitPerLimit, &r.FilledProfit, &r.GpDay,
-				&r.HighAgeS, &r.LowAgeS, &r.Vol5m, &r.Vol24h); err != nil {
+				&r.HighAgeS, &r.LowAgeS, &r.Vol5m, &r.Vol24h,
+				&r.MarginPersistence24h, &r.PersistObsHours, &r.Roundtrips24h); err != nil {
 				return nil, err
 			}
 			out = append(out, r)
@@ -159,6 +177,7 @@ func TopFlipsHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 			"sort_by": sortBy, "min_volume": minVolume,
 			"min_vol24h": minVol24h, "min_price": minPrice,
 			"gp_day_basis": "margin x min(buy_limit x 6 cycles/day, 15% participation of vol24h); a ceiling, not a promise — self-impact and fill risk are yours to model",
+			"persistence_basis": "margin_persistence_24h = hours (of 24) whose hourly avg post-tax spread held >= 50% of the current margin; unobserved hours count as not-persistent (persist_obs_hours = both-sides hours seen). roundtrips_24h = 30-min windows where both sides printed at a positive post-tax spread",
 		}
 		// Latest-row tool: data_window = ts bounds of the returned rows.
 		if len(out) > 0 {

@@ -14,8 +14,9 @@ import (
 
 const maxQuotesBatch = 25
 
-// QUERIES #16 — #0 batched with ANY($1).
-const quotesSQL = `
+// QUERIES #16 — #0 batched with ANY($1). Persistence laterals per row: at
+// most 25 items, each a single-item 24h index scan.
+var quotesSQL = `
 WITH q AS (
   SELECT DISTINCT ON (item_id) item_id, ts, high, high_time, low, low_time, margin
   FROM prices_1m WHERE item_id = ANY($1) ORDER BY item_id, ts DESC
@@ -30,8 +31,10 @@ SELECT q.item_id, i.name, q.ts,
        q.high, q.high_time, extract(epoch from now() - q.high_time)::int AS high_age_s,
        q.low,  q.low_time,  extract(epoch from now() - q.low_time)::int  AS low_age_s,
        q.margin,
-       coalesce(liq.vol5m, 0) AS vol5m
+       coalesce(liq.vol5m, 0) AS vol5m,
+       ` + persistenceSelect("q.margin") + `
 FROM q JOIN items i USING (item_id) LEFT JOIN liq USING (item_id)
+` + persistenceJoins("q.item_id", "q.margin") + `
 ORDER BY q.item_id`
 
 func NewQuotesTool() mcp.Tool {
@@ -92,7 +95,8 @@ func QuotesHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 				if err := rows.Scan(&r.ItemID, &r.Name, &r.Ts,
 					&r.High, &r.HighTime, &r.HighAgeS,
 					&r.Low, &r.LowTime, &r.LowAgeS,
-					&r.Margin, &r.Vol5m); err != nil {
+					&r.Margin, &r.Vol5m,
+					&r.MarginPersistence24h, &r.PersistObsHours, &r.Roundtrips24h); err != nil {
 					return nil, err
 				}
 				out = append(out, r)

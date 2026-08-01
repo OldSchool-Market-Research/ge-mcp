@@ -77,8 +77,19 @@ The discovery primitive behind the two flip lanes (2026-07-18 flips-first redesi
   - **Lane B (high-value flips):** `min_price=10000000, min_vol24h=200, max_age='30min', sort_by=margin`.
   - Default `min_volume=50` keeps the tool genuinely *liquid* (the liquidity-gate join is
     always applied); pass `min_volume=0` to loosen to a freshness-only baseline.
-- **Returns per row:** `buy_at, sell_at, margin, roi_pct, buy_limit, profit_per_limit, filled_profit, gp_day, high_age_s, low_age_s, vol5m, vol24h`
-- **Backed by:** [QUERIES #2](./QUERIES.md#2-real-flips--fresh-liquid-ranked-by-profit-per-limit--ship-this)
+- **Returns per row:** `buy_at, sell_at, margin, roi_pct, buy_limit, profit_per_limit, filled_profit, gp_day, high_age_s, low_age_s, vol5m, vol24h, margin_persistence_24h, persist_obs_hours, roundtrips_24h`
+  - `margin_persistence_24h` — share of the last 24 wall-clock hours whose hourly avg
+    post-tax spread held ≥ 50% of the current margin (fixed /24 denominator: an hour
+    where either side didn't trade counts as *not persistent* — an unobserved spread is
+    not a demonstrated spread; `persist_obs_hours` carries the both-sides sample count).
+    The 2026-08-01 persistence amendment: "the margin is persistent" was the one ship-bar
+    criterion with no tool-computed number — the 14-day paper record showed the median
+    shipped F margin at 40% of its claim 15 minutes after ship, 8% at 45 minutes.
+  - `roundtrips_24h` — 30-min buckets in the last 24h where BOTH sides printed at a
+    positive post-tax spread: how often a profitable round trip actually happened. The
+    high-value screen's dead-book detector (a quoted 2M spread with legs days apart
+    scores 0).
+- **Backed by:** [QUERIES #2](./QUERIES.md#2-real-flips--fresh-liquid-ranked-by-profit-per-limit--ship-this) + [QUERIES #22](./QUERIES.md#22-margin-persistence--round-trip-frequency--the-spike-vs-standing-spread-laterals)
 
 #### `margin_zscore`
 Spreads abnormally wide vs the item's *own* recent baseline (mean reversion).
@@ -184,8 +195,10 @@ Current both-leg snapshot + freshness for one item. Required by the directive's
 falsification check ("are both legs fresh, or is the margin a stale-leg artifact?") and the
 worked example's *"both legs fresh within 6 min ✓"*.
 - **Params:** `name_or_id`
-- **Returns:** `high, high_time, high_age_s, low, low_time, low_age_s, margin, ts, vol5m`
-- **Backed by:** [QUERIES building blocks #1 + #2](./QUERIES.md#building-blocks)
+- **Returns:** `high, high_time, high_age_s, low, low_time, low_age_s, margin, ts, vol5m, margin_persistence_24h, persist_obs_hours, roundtrips_24h`
+  (persistence fields as in `top_flips` — the falsification call answers spike-vs-standing
+  in the same round trip; `margin_persistence_24h` is null when `margin` is null)
+- **Backed by:** [QUERIES building blocks #1 + #2](./QUERIES.md#building-blocks) + [QUERIES #22](./QUERIES.md#22-margin-persistence--round-trip-frequency--the-spike-vs-standing-spread-laterals)
 
 #### `quotes`  *(batch — the watchlist primitive)*
 `quote` for up to 25 items in one call — re-checking N candidates otherwise costs N
