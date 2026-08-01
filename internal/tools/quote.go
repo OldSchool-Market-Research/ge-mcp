@@ -14,8 +14,10 @@ import (
 
 // QUERIES #0 — the falsification primitive. LEFT JOIN the liquidity CTE: an
 // item can have a fresh quote but no 5m row in the last 15m; return vol5m=0
-// rather than dropping the quote. Prices stay nullable.
-const quoteSQL = `
+// rather than dropping the quote. Prices stay nullable. The persistence
+// laterals ride along so a single-candidate falsification check gets the
+// spike-vs-standing-spread answer in the same call.
+var quoteSQL = `
 WITH q AS (
   SELECT DISTINCT ON (item_id) item_id, ts, high, high_time, low, low_time, margin
   FROM prices_1m WHERE item_id = $1 ORDER BY item_id, ts DESC
@@ -30,8 +32,10 @@ SELECT q.item_id, i.name, q.ts,
        q.high, q.high_time, extract(epoch from now() - q.high_time)::int AS high_age_s,
        q.low,  q.low_time,  extract(epoch from now() - q.low_time)::int  AS low_age_s,
        q.margin,
-       coalesce(liq.vol5m, 0) AS vol5m
-FROM q JOIN items i USING (item_id) LEFT JOIN liq USING (item_id)`
+       coalesce(liq.vol5m, 0) AS vol5m,
+       ` + persistenceSelect("q.margin") + `
+FROM q JOIN items i USING (item_id) LEFT JOIN liq USING (item_id)
+` + persistenceJoins("q.item_id", "q.margin")
 
 type quoteRow struct {
 	ItemID   int        `json:"item_id"`
@@ -45,11 +49,15 @@ type quoteRow struct {
 	LowAgeS  *int       `json:"low_age_s"`
 	Margin   *int64     `json:"margin"`
 	Vol5m    int64      `json:"vol5m"`
+
+	MarginPersistence24h *float64 `json:"margin_persistence_24h"`
+	PersistObsHours      int      `json:"persist_obs_hours"`
+	Roundtrips24h        int      `json:"roundtrips_24h"`
 }
 
 func NewQuoteTool() mcp.Tool {
 	return mcp.NewTool("quote",
-		mcp.WithDescription("Current both-leg snapshot + per-leg freshness for one item (the falsification primitive: are both legs fresh, or is the margin a stale-leg artifact?). margin is post-tax, read from storage, never recomputed. Null prices mean nothing traded that side."),
+		mcp.WithDescription("Current both-leg snapshot + per-leg freshness for one item (the falsification primitive: are both legs fresh, or is the margin a stale-leg artifact?). margin is post-tax, read from storage, never recomputed. Null prices mean nothing traded that side. margin_persistence_24h (share of the last 24 hours whose hourly avg post-tax spread held >= 50% of the current margin) and roundtrips_24h (30-min windows today where both sides printed at a positive post-tax spread) answer the follow-up: is this margin a standing spread or a momentary spike?"),
 		mcp.WithString("name_or_id", mcp.Required(), mcp.Description("Item name (fuzzy, best match) or numeric item_id")),
 	)
 }
@@ -70,7 +78,8 @@ func QuoteHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 			&r.ItemID, &r.Name, &r.Ts,
 			&r.High, &r.HighTime, &r.HighAgeS,
 			&r.Low, &r.LowTime, &r.LowAgeS,
-			&r.Margin, &r.Vol5m)
+			&r.Margin, &r.Vol5m,
+			&r.MarginPersistence24h, &r.PersistObsHours, &r.Roundtrips24h)
 
 		env := envelope.New([]quoteRow{}, 0)
 		env.Resolved = res
