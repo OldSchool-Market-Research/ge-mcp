@@ -43,17 +43,30 @@ latest5 AS (
          coalesce(high_volume,0)+coalesce(low_volume,0) AS vol5m
   FROM prices_5m WHERE item_id IN (SELECT item_id FROM legs)
   ORDER BY item_id, ts DESC
+),
+act AS (
+  -- Per-side trade cadence over 24h: how often does this leg actually print?
+  -- Freshness is judged against the leg's own cadence, not wall clock — a
+  -- hilt trading 30x/day is fresh at 2h; an alch-feed item is not.
+  SELECT item_id,
+         count(*) FILTER (WHERE coalesce(low_volume,0)  > 0) AS low_ticks_24h,
+         count(*) FILTER (WHERE coalesce(high_volume,0) > 0) AS high_ticks_24h
+  FROM prices_5m WHERE item_id IN (SELECT item_id FROM legs)
+    AND ts > now() - interval '24 hours'
+  GROUP BY item_id
 )
 SELECT leg.side, leg.item_id, i.name, leg.qty, i.buy_limit,
        CASE WHEN leg.side='buy' THEN l1.low ELSE l1.high END AS price,
        CASE WHEN leg.side='sell' AND l1.high IS NOT NULL
             THEN LEAST(l1.high/50, 5000000) ELSE 0 END AS tax,
        extract(epoch from now() - CASE WHEN leg.side='buy' THEN l1.low_time ELSE l1.high_time END)::bigint AS age_s,
-       l5.vol5m
+       l5.vol5m,
+       CASE WHEN leg.side='buy' THEN a.low_ticks_24h ELSE a.high_ticks_24h END AS trades_24h
 FROM legs leg
 JOIN items i USING (item_id)
 LEFT JOIN latest1 l1 USING (item_id)
 LEFT JOIN latest5 l5 USING (item_id)
+LEFT JOIN act a USING (item_id)
 ORDER BY leg.side, leg.item_id`
 
 type comboLegRow struct {
@@ -66,11 +79,16 @@ type comboLegRow struct {
 	Tax      int64  `json:"tax"`
 	AgeS     *int64 `json:"age_s"`
 	Vol5m    *int64 `json:"vol5m"`
+
+	// Cadence-relative freshness (2026-08): a leg is judged against how
+	// often it trades, not against the wall clock.
+	Trades24h   *int64 `json:"trades_24h"`
+	TypicalGapS *int64 `json:"typical_gap_s"`
 }
 
 func NewComboQuoteTool() mcp.Tool {
 	return mcp.NewTool("combo_quote",
-		mcp.WithDescription("Price one relation end-to-end at the latest quotes (archetype C's falsification primitive): buy legs at `low`, sell legs at `high` minus GE tax (2%, capped 5M, per unit). meta.summary carries input_cost, output_revenue_post_tax, combo_margin (per conversion), roi_pct, max_leg_age_s (worst-leg freshness — a stale leg voids the quote), min-leg volume, and units_bound = the conversions/4h the tightest buy-limit leg allows. A leg with no traded side has price null and combo_margin is null — that leg is untradeable right now, not free. Get relation_ids from list_relations; direction=reverse only for reversible relations."),
+		mcp.WithDescription("Price one relation end-to-end at the latest quotes (archetype C's falsification primitive): buy legs at `low`, sell legs at `high` minus GE tax (2%, capped 5M, per unit). meta.summary carries input_cost, output_revenue_post_tax, combo_margin (per conversion), roi_pct, min-leg volume, and units_bound = the conversions/4h the tightest buy-limit leg allows. Freshness is CADENCE-RELATIVE: each leg carries trades_24h and typical_gap_s (86400/trades), and the summary's worst_leg_age_ratio = age_s/typical_gap_s for the slowest leg — a ratio <= ~3 is that leg's normal cadence, NOT staleness; a high ratio means re-call this tool before judging, never dismiss on age alone. A leg with no traded side has price null and combo_margin is null — that leg is untradeable right now, not free. Get relation_ids from list_relations; direction=reverse only for reversible relations."),
 		mcp.WithNumber("relation_id", mcp.Required(), mcp.Description("From list_relations")),
 		mcp.WithString("direction", mcp.Enum("forward", "reverse"), mcp.Description("forward = buy inputs, sell outputs (default); reverse only if the relation is reversible")),
 	)
@@ -115,8 +133,12 @@ func ComboQuoteHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 		for rows.Next() {
 			var r comboLegRow
 			if err := rows.Scan(&r.Side, &r.ItemID, &r.Name, &r.Qty, &r.BuyLimit,
-				&r.Price, &r.Tax, &r.AgeS, &r.Vol5m); err != nil {
+				&r.Price, &r.Tax, &r.AgeS, &r.Vol5m, &r.Trades24h); err != nil {
 				return nil, err
+			}
+			if r.Trades24h != nil && *r.Trades24h > 0 {
+				gap := int64(86400) / *r.Trades24h
+				r.TypicalGapS = &gap
 			}
 			out = append(out, r)
 		}
@@ -130,6 +152,7 @@ func ComboQuoteHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 		var maxAge *int64
 		var minVol *int64
 		var unitsBound *int64
+		var worstAgeRatio *float64
 		for _, l := range out {
 			if l.Price == nil {
 				missingLeg = fmt.Sprintf("%s leg %q has no traded price", l.Side, l.Name)
@@ -152,6 +175,12 @@ func ComboQuoteHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 			if l.Vol5m != nil && (minVol == nil || *l.Vol5m < *minVol) {
 				minVol = l.Vol5m
 			}
+			if l.AgeS != nil && l.TypicalGapS != nil && *l.TypicalGapS > 0 {
+				ratio := float64(*l.AgeS) / float64(*l.TypicalGapS)
+				if worstAgeRatio == nil || ratio > *worstAgeRatio {
+					worstAgeRatio = &ratio
+				}
+			}
 		}
 
 		summary := map[string]any{
@@ -159,6 +188,10 @@ func ComboQuoteHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 			"notes":         relNotes,
 			"max_leg_age_s": maxAge, "min_leg_vol5m": minVol,
 			"units_bound_per_4h": unitsBound,
+			// age / typical gap for the worst leg: <= ~3 is normal cadence,
+			// not staleness. A slow leg is a reason to re-quote, not to
+			// dismiss the conversion.
+			"worst_leg_age_ratio": worstAgeRatio,
 		}
 		if missingLeg != "" {
 			summary["combo_margin"] = nil
