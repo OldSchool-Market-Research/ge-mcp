@@ -550,11 +550,20 @@ player can't perform is not their edge).
 (integer division — the ingest margin formula applied to a sell leg; **not** a
 recomputation of the stored single-item `margin`, which never applies to multi-item
 conversions). Summary: `input_cost`, `output_revenue_post_tax`, `combo_margin`,
-`roi_pct`, `max_leg_age_s` (worst leg governs freshness), `min_leg_vol5m`,
+`roi_pct`, `max_leg_age_s`, `min_leg_vol5m`,
 `units_bound_per_4h` = min over buy legs of `buy_limit / qty`. A null-priced leg ⇒
 `combo_margin` null with the leg named (nulls are signal). `direction=reverse` only
 for `reversible` rows (typed error `not_reversible`). Validated: Prayer potion decant
 forward/reverse round-trip prices with correct sign flip and taxes.
+
+Freshness is cadence-relative (2026-08-11 amendment): each leg carries `trades_24h`
+(5m rows in 24h where that leg's side printed) and `typical_gap_s = 86400 /
+trades_24h`; the summary's `worst_leg_age_ratio` = max over legs of `age_s /
+typical_gap_s`. A ratio ≤ ~3 is the leg's own normal cadence — the fortnight's one
+big C winner class (godsword combines) was being dismissed on wall-clock age (a
+4.7h-"stale" hilt that trades ~30x/day). High ratio ⇒ re-quote, don't dismiss.
+Validated live: Super restore decant legs at 250/274 trades per 24h ⇒ typical gaps
+~345/315s.
 - SQL: `internal/tools/combo_quote.go`.
 - **→ tool:** `combo_quote(relation_id, direction ∈ forward|reverse)`
 
@@ -605,6 +614,24 @@ history → `0 / 0 / 0`). `margin_persistence_24h` is null when the current marg
 null: no reference spread, no persistence claim.
 - SQL: `internal/tools/persistence.go` (shared by the three tools).
 - **→ fields on:** `top_flips`, `quote`, `quotes`
+
+### 23. Ship-time flip sizing — `flip_quote`
+**Answers:** what will the orchestrator's ship-time vetter compute for this flip, and
+what is the largest `per_cycle_gp` claim that survives it? Mirrors `evSanity`
+(ge-orchestrator `internal/runner/vet.go`) and `ProjectFlipPer1h` (`internal/eval/flip.go`)
+exactly — deliberate constant duplication across modules, cross-referenced in both
+files: participation 0.15, slippage 0.005, 4h cycle, `vol30m` = both sides of
+`prices_5m` summed over 30 min (the evaluator's own snapshot window). Summary:
+`fillable_units = max(1, ⌊0.15 × vol30m × 8⌋)`, `units_capped = min(units,
+fillable_units)`, `per_cycle_ceiling = margin × units_capped`, `vet_max_claim = 2 ×
+ceiling` (claims above are vetoed), `harness_per_1h` (slipped, taxed,
+participation-capped, ÷4 — the confirm-ratio denominator), plus `buy_limit` and the
+#22 persistence stats. Null margin ⇒ null ceiling with a note (nulls are signal).
+Exists because the first post-gate week vetoed 35 of 37 ships on exactly this
+arithmetic, which the agent could not run. Validated live on Prayer potion(4) (both
+legs, persistence riding along).
+- SQL + mirror math: `internal/tools/flip_quote.go`.
+- **→ tool:** `flip_quote(name_or_id, units, entry_price?, exit_price?)`
 
 ---
 

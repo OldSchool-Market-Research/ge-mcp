@@ -51,6 +51,8 @@ func main() {
 	// Conversions (archetype C)
 	s.AddTool(tools.NewListRelationsTool(), tools.ListRelationsHandler(pool))
 	s.AddTool(tools.NewComboQuoteTool(), tools.ComboQuoteHandler(pool))
+	// Ship-time sizing (lanes F/B)
+	s.AddTool(tools.NewFlipQuoteTool(), tools.FlipQuoteHandler(pool))
 
 	if err := server.ServeStdio(s); err != nil {
 		log.Fatalf("serve: %v", err)
