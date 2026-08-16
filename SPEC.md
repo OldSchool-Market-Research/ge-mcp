@@ -46,7 +46,7 @@ the same shape. Lock these globally:
 
 ---
 
-## 3. The tool surface (14 tools)
+## 3. The tool surface (16 tools)
 
 Split into **discovery** (cast wide, ranked candidate sets), **evidence** (drill one
 item) and **conversions** (multi-leg pricing). Seven are the original directive's;
@@ -58,6 +58,8 @@ new `screen` metrics) were added in the 2026-07-13 money-signals amendment
 a strategy.) The 2026-07-14 archetype re-architecture (S/V/C/U/H) extended
 `seasonality` (hour-of-week + price level) and added `seasonal_scan`, `volume_zscore`,
 `list_relations`, `combo_quote` ([QUERIES #17–#21](./QUERIES.md#new-archetypes-2026-07-14-re-architecture--all-validated-live)).
+`combo_screen` (2026-08-16) batches #21 across the whole relation set — one call
+replaces the per-relation `combo_quote` sweep that dominated run token burn.
 
 ### Discovery
 
@@ -172,9 +174,25 @@ gates and fees.
   inputs[{item_id, qty, name, buy_limit}], outputs[...]`
 - **Backed by:** [QUERIES #20](./QUERIES.md#20-relations-listing--list_relations)
 
+#### `combo_screen`
+Rank the whole C universe in one call (2026-08-16, the anti-machine-gun tool: run 921
+made 46 single `combo_quote` calls to do what this does once). Prices every
+`item_relations` row forward with `combo_quote`'s leg math and returns one summary row
+per relation, ranked `combo_margin DESC NULLS LAST`. A relation with an unpriced leg
+keeps `combo_margin` null + `missing_legs > 0` — unpriceable now, not zero.
+- **Params:** `kind?`, `relation_ids?` (max 50), `limit=25` (post-ranking;
+  `meta.screened` vs `meta.returned` says what the cap dropped — no silent truncation)
+- **Returns per row:** `relation_id, kind, name, reversible, input_cost,
+  output_revenue_post_tax, combo_margin, roi_pct, min_leg_vol5m, worst_leg_age_ratio,
+  units_bound_per_4h, missing_legs`
+- **Backed by:** [QUERIES #21](./QUERIES.md#21-conversion-quote--combo_quote) batched
+  with the relation set inlined as a CTE; per-relation aggregation in Go, shared with
+  `combo_quote`'s summary math. Forward direction only — reverse needs `combo_quote`.
+
 #### `combo_quote`
 Price one relation end-to-end at the latest quotes: buy legs at `low`, sell legs at
 `high` − per-leg tax `LEAST(high/50, 5M)`. Null leg ⇒ null combo_margin (signal).
+Deep-dive tool: screen with `combo_screen` first, then quote the top few here.
 - **Params:** `relation_id` (required), `direction ∈ forward | reverse` (reverse only
   if reversible — typed error `not_reversible`)
 - **Returns:** one row per leg (`side, item_id, name, qty, buy_limit, price, tax,
