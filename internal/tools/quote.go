@@ -57,7 +57,7 @@ type quoteRow struct {
 
 func NewQuoteTool() mcp.Tool {
 	return mcp.NewTool("quote",
-		mcp.WithDescription("Current both-leg snapshot + per-leg freshness for one item (the falsification primitive: are both legs fresh, or is the margin a stale-leg artifact?). margin is post-tax, read from storage, never recomputed. Null prices mean nothing traded that side. margin_persistence_24h (share of the last 24 hours whose hourly avg post-tax spread held >= 50% of the current margin) and roundtrips_24h (30-min windows today where both sides printed at a positive post-tax spread) answer the follow-up: is this margin a standing spread or a momentary spike?"),
+		mcp.WithDescription("Current both-leg snapshot + per-leg freshness for ONE item — checking 2+ items? Use the batch `quotes` tool instead: one call, same row shape, up to 25 items. (The falsification primitive: are both legs fresh, or is the margin a stale-leg artifact?) margin is post-tax, read from storage, never recomputed. Null prices mean nothing traded that side. margin_persistence_24h (share of the last 24 hours whose hourly avg post-tax spread held >= 50% of the current margin) and roundtrips_24h (30-min windows today where both sides printed at a positive post-tax spread) answer the follow-up: is this margin a standing spread or a momentary spike?"),
 		mcp.WithString("name_or_id", mcp.Required(), mcp.Description("Item name (fuzzy, best match) or numeric item_id")),
 	)
 }

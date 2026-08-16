@@ -50,6 +50,7 @@ func main() {
 	s.AddTool(tools.NewVolumeZscoreTool(), tools.VolumeZscoreHandler(pool))
 	// Conversions (archetype C)
 	s.AddTool(tools.NewListRelationsTool(), tools.ListRelationsHandler(pool))
+	s.AddTool(tools.NewComboScreenTool(), tools.ComboScreenHandler(pool))
 	s.AddTool(tools.NewComboQuoteTool(), tools.ComboQuoteHandler(pool))
 	// Ship-time sizing (lanes F/B)
 	s.AddTool(tools.NewFlipQuoteTool(), tools.FlipQuoteHandler(pool))
