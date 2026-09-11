@@ -19,6 +19,13 @@ const maxComboScreenIDs = 50
 // C universe. Aggregation stays in Go (shared shape with combo_quote's
 // summary math) so NULL legs stay signal per relation instead of poisoning
 // the batch.
+//
+// latest1/latest5 deliberately diverge from combo_quote's DISTINCT ON shape:
+// with the whole universe's legs (~300 items) in the IN-list the planner
+// abandons per-item index descents and scans entire hypertable chunks (~82s
+// on prod, past the 30s statement timeout). LATERAL LIMIT 1 pins one index
+// descent per item (~180ms). An item with no rows yields no row here, same
+// as DISTINCT ON — the outer LEFT JOIN keeps null legs signal.
 const comboScreenSQL = `
 WITH rel AS (
   SELECT relation_id, kind, name, reversible FROM item_relations
@@ -33,15 +40,22 @@ legs AS (
   FROM rel JOIN item_relations r USING (relation_id), jsonb_array_elements(r.outputs) l
 ),
 latest1 AS (
-  SELECT DISTINCT ON (item_id) item_id, high, high_time, low, low_time
-  FROM prices_1m WHERE item_id IN (SELECT item_id FROM legs)
-  ORDER BY item_id, ts DESC
+  SELECT ids.item_id, p.high, p.high_time, p.low, p.low_time
+  FROM (SELECT DISTINCT item_id FROM legs) ids
+  CROSS JOIN LATERAL (
+    SELECT high, high_time, low, low_time
+    FROM prices_1m WHERE item_id = ids.item_id
+    ORDER BY ts DESC LIMIT 1
+  ) p
 ),
 latest5 AS (
-  SELECT DISTINCT ON (item_id) item_id,
-         coalesce(high_volume,0)+coalesce(low_volume,0) AS vol5m
-  FROM prices_5m WHERE item_id IN (SELECT item_id FROM legs)
-  ORDER BY item_id, ts DESC
+  SELECT ids.item_id, coalesce(p.high_volume,0)+coalesce(p.low_volume,0) AS vol5m
+  FROM (SELECT DISTINCT item_id FROM legs) ids
+  CROSS JOIN LATERAL (
+    SELECT high_volume, low_volume
+    FROM prices_5m WHERE item_id = ids.item_id
+    ORDER BY ts DESC LIMIT 1
+  ) p
 ),
 act AS (
   SELECT item_id,
