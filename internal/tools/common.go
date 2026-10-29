@@ -28,8 +28,10 @@ func resolveItem(ctx context.Context, pool *pgxpool.Pool, nameOrID string) (*env
 
 	var r envelope.Resolved
 	var err error
-	if id, convErr := strconv.Atoi(nameOrID); convErr == nil {
+	if id, convErr := strconv.ParseInt(nameOrID, 10, 32); convErr == nil {
 		err = pool.QueryRow(ctx, `SELECT item_id, name FROM items WHERE item_id = $1`, id).Scan(&r.ItemID, &r.Name)
+	} else if errors.Is(convErr, strconv.ErrRange) {
+		err = pgx.ErrNoRows // numeric but outside int4: binding it would fail the whole run
 	} else {
 		err = pool.QueryRow(ctx, `
 			SELECT item_id, name FROM items
