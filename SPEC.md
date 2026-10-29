@@ -46,7 +46,7 @@ the same shape. Lock these globally:
 
 ---
 
-## 3. The tool surface (16 tools)
+## 3. The tool surface (20 tools)
 
 Split into **discovery** (cast wide, ranked candidate sets), **evidence** (drill one
 item) and **conversions** (multi-leg pricing). Seven are the original directive's;
@@ -60,6 +60,10 @@ a strategy.) The 2026-07-14 archetype re-architecture (S/V/C/U/H) extended
 `list_relations`, `combo_quote` ([QUERIES #17–#21](./QUERIES.md#new-archetypes-2026-07-14-re-architecture--all-validated-live)).
 `combo_screen` (2026-08-16) batches #21 across the whole relation set — one call
 replaces the per-relation `combo_quote` sweep that dominated run token burn.
+The four `process_*` tools (2026-10-29) cover **processing recipes**: player-time
+money-makers ranked by gp/hr, read from ge-data's `process_quotes_now` /
+`process_legs_now` views and `process_snapshots` (init/04-06). The math lives in
+those views; the tools only filter, sort and aggregate.
 
 ### Discovery
 
@@ -199,6 +203,49 @@ Deep-dive tool: screen with `combo_screen` first, then quote the top few here.
   age_s, vol5m`) + `meta.summary` (`input_cost, output_revenue_post_tax, combo_margin,
   roi_pct, max_leg_age_s, min_leg_vol5m, units_bound_per_4h, notes`)
 - **Backed by:** [QUERIES #21](./QUERIES.md#21-conversion-quote--combo_quote)
+
+### Processing recipes (gp/hr)
+
+All four return typed `process_unavailable` when ge-data init/04-06 isn't applied,
+and resolve `recipe` as a numeric `recipe_id` or a name (exact first, then the
+shortest containing match; `recipe_not_found` otherwise). Margins: `slow` = buy
+inputs at `low`, sell outputs at `high` − tax (`LEAST(price/50, 5M)` per unit), minus
+`fee_gp`; `insta` = the reverse prices. A null margin with `missing_legs > 0` is an
+unpriceable leg, not zero. Skill/quest requirements are not curated.
+
+#### `process_screen`
+Rank the whole processing universe from `process_quotes_now` in one call.
+- **Params:** `category?` (substring), `throughput? ∈ fixed | volume_capped |
+  volume_bound | unknown`, `sort ∈ gp_hr (default) | gp_hr_insta | gp_hr_theoretical
+  | margin_slow`, `limit=25` (max 100; `meta.screened` vs `meta.returned`)
+- **Returns per row:** `recipe_id, name, category, throughput, margin_slow,
+  margin_insta, gp_hr, gp_hr_insta, gp_hr_theoretical, actions_per_hour,
+  effective_actions_per_hour, limit_actions_per_hour, market_actions_per_hour,
+  fee_gp, missing_legs, max_leg_age_s`. `gp_hr` uses
+  `effective = LEAST(player rate, buy-limit rate, 24h market-volume rate)`;
+  `gp_hr_theoretical` is player rate only (the sheet's figure; overstates thin items).
+
+#### `process_quote`
+One recipe leg by leg (`process_legs_now`) plus its `process_screen` row.
+- **Params:** `recipe` (required)
+- **Returns:** one row per leg (`side, item_id, name, qty` (may be fractional),
+  `buy_limit, price_slow, price_insta, age_s, fill_volume_24h`) + `meta.summary`,
+  `meta.source` (sheet row), `meta.relation_name/relation_direction` when the legs
+  come from `item_relations`, `meta.notes`
+
+#### `process_history`
+One recipe's trend from `process_snapshots`.
+- **Params:** `recipe` (required), `window='7d'` (max 90d), `bucket ∈ 1h | 6h (default) | 1d`
+- **Returns per bucket:** `bucket, margin_slow, margin_insta, gp_hr, gp_hr_insta,
+  effective_actions_per_hour` (averages over priced hours), `hours, priced_hours`
+
+#### `process_top`
+Consistent performers over a window from `process_snapshots`, ranked by median.
+- **Params:** `window='7d'` (max 90d), `metric ∈ gp_hr (default) | gp_hr_insta |
+  margin_slow`, `category?`, `limit=20` (max 100)
+- **Returns per row:** `recipe_id, name, category, hours, priced_hours, avg, median,
+  p25, pct_hours_positive` (of all hours; unpriced hours count as not positive),
+  `hours_in_top10` (per-hour rank across ALL recipes), `avg_last_24h`
 
 ### Evidence
 
