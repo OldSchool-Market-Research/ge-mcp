@@ -206,12 +206,17 @@ Deep-dive tool: screen with `combo_screen` first, then quote the top few here.
 
 ### Processing recipes (gp/hr)
 
-All four return typed `process_unavailable` when ge-data init/04-06 isn't applied,
-and resolve `recipe` as a numeric `recipe_id` or a name (exact first, then the
-shortest containing match; `recipe_not_found` otherwise). Margins: `slow` = buy
-inputs at `low`, sell outputs at `high` − tax (`LEAST(price/50, 5M)` per unit), minus
-`fee_gp`; `insta` = the reverse prices. A null margin with `missing_legs > 0` is an
-unpriceable leg, not zero. Skill/quest requirements are not curated.
+Every DB error from all four goes through one exit: a missing relation (42P01,
+e.g. 04-05 applied without 06) or a missing grant (42501) returns typed
+`process_unavailable`, never a raw error (ge-agent fails the whole run on one).
+`recipe` is a `recipe_id` (JSON number or string; out-of-int4 → `recipe_not_found`)
+or a name (exact first, then the shortest containing match; `recipe_not_found`
+otherwise). Margins: `slow` = buy inputs at `low`, sell outputs at `high` − tax
+(`LEAST(price/50, 5M)` per unit), minus `fee_gp`; `insta` = the reverse prices.
+`gp_hr_insta` uses the insta fill side's volume. A null margin with
+`missing_legs` (slow side) / `missing_legs_insta` > 0 is an unpriceable leg, not
+zero; `throughput=unknown` has no rate, so its `gp_hr` is null (rank on
+`margin_slow`). Skill/quest requirements are not curated.
 
 #### `process_screen`
 Rank the whole processing universe from `process_quotes_now` in one call.
@@ -221,30 +226,36 @@ Rank the whole processing universe from `process_quotes_now` in one call.
 - **Returns per row:** `recipe_id, name, category, throughput, margin_slow,
   margin_insta, gp_hr, gp_hr_insta, gp_hr_theoretical, actions_per_hour,
   effective_actions_per_hour, limit_actions_per_hour, market_actions_per_hour,
-  fee_gp, missing_legs, max_leg_age_s`. `gp_hr` uses
+  effective_actions_per_hour_insta, market_actions_per_hour_insta, fee_gp,
+  missing_legs, missing_legs_insta, unknown_limit_legs, max_leg_age_s`. `gp_hr` uses
   `effective = LEAST(player rate, buy-limit rate, 24h market-volume rate)`;
   `gp_hr_theoretical` is player rate only (the sheet's figure; overstates thin items).
 
 #### `process_quote`
-One recipe leg by leg (`process_legs_now`) plus its `process_screen` row.
+One recipe leg by leg (`process_legs_now`) plus its `process_screen` row, read in
+one REPEATABLE READ snapshot so the legs reproduce the summary.
 - **Params:** `recipe` (required)
 - **Returns:** one row per leg (`side, item_id, name, qty` (may be fractional),
-  `buy_limit, price_slow, price_insta, age_s, fill_volume_24h`) + `meta.summary`,
+  `buy_limit, price_slow, price_insta, slow_age_s, fill_volume_24h`) + `meta.summary`,
   `meta.source` (sheet row), `meta.relation_name/relation_direction` when the legs
   come from `item_relations`, `meta.notes`
 
 #### `process_history`
 One recipe's trend from `process_snapshots`.
-- **Params:** `recipe` (required), `window='7d'` (max 90d), `bucket ∈ 1h | 6h (default) | 1d`
+- **Params:** `recipe` (required), `window='7d'` (max 90d), `bucket ∈ 1h | 6h (default) | 1d`;
+  at most 400 buckets per call (`bad_param` otherwise)
 - **Returns per bucket:** `bucket, margin_slow, margin_insta, gp_hr, gp_hr_insta,
-  effective_actions_per_hour` (averages over priced hours), `hours, priced_hours`
+  effective_actions_per_hour` (averages over hours with a value), `hours`,
+  `priced_hours` (hours with a margin); `meta` echoes `recipe_id, name, bucket`
 
 #### `process_top`
 Consistent performers over a window from `process_snapshots`, ranked by median.
 - **Params:** `window='7d'` (max 90d), `metric ∈ gp_hr (default) | gp_hr_insta |
-  margin_slow`, `category?`, `limit=20` (max 100)
-- **Returns per row:** `recipe_id, name, category, hours, priced_hours, avg, median,
-  p25, pct_hours_positive` (of all hours; unpriced hours count as not positive),
+  margin_slow`, `category?`, `min_coverage_pct=50` (recipes with the metric in fewer
+  hours are left out), `limit=20` (max 100)
+- **Returns per row:** `recipe_id, name, category, hours, priced_hours` (hours with a
+  margin, as in `process_history`), `metric_hours` (hours with the metric),
+  `avg, median, p25` (over metric_hours), `pct_hours_positive` (of all hours),
   `hours_in_top10` (per-hour rank across ALL recipes), `avg_last_24h`
 
 ### Evidence

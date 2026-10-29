@@ -140,7 +140,9 @@ This is the security boundary. "No SQL passthrough" is necessary but not suffici
 
 Two outcomes, never conflated:
 - **Bad input** → typed error `{ error: { code, reason } }`. Codes: `item_not_found` (no
-  fuzzy match at all), `bad_param` (malformed duration/enum/limit). Returned as an MCP tool
+  fuzzy match at all), `recipe_not_found` (process tools), `bad_param` (malformed
+  duration/enum/limit), and the deploy-state codes `relations_unavailable` /
+  `process_unavailable` (ge-data DDL not applied or not readable). Returned as an MCP tool
   error so the agent sees a structured failure.
 - **No data in window** → **not an error.** `rows: []` + `note`. "Nothing traded" is a real
   liquidity signal the directive values (constraint #2). All tools follow this split.

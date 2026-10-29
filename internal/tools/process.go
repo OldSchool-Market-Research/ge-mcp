@@ -21,81 +21,141 @@ import (
 // process_quotes_now / process_legs_now views and the ingester's hourly
 // process_snapshots; these tools only filter, sort and aggregate. Re-deriving
 // a margin here would let the agent and the dashboard disagree.
+//
+// Every DB error goes through processFail: ge-agent fails the whole run on a
+// raw handler error, and a half-applied schema (04-05 without 06) or a
+// missing grant is a deploy state, not a reason to lose a run.
 
-// processUnavailable converts a missing process table/view (42P01) into a
-// typed tool error: the schema ships as a manual DDL apply separate from this
-// binary, and a run must be able to note it and continue.
+// processUnavailable converts a missing relation (42P01) or a missing grant
+// (42501, e.g. DDL applied by a role other than ge-data so the default
+// privileges didn't attach) into a typed tool error.
 func processUnavailable(err error) *mcp.CallToolResult {
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
+	if errors.As(err, &pgErr) && (pgErr.Code == "42P01" || pgErr.Code == "42501") {
 		return mcp.NewToolResultError(envelope.ErrorJSON("process_unavailable",
-			"the process_recipes schema (ge-data init/04-06) is not present in this database: processing tools are unavailable; note it and continue"))
+			"the processing schema (ge-data init/04-06) is not present or not readable in this database: processing tools are unavailable; note it and continue"))
 	}
 	return nil
 }
 
+// processFail is the one exit for a DB error: typed when it's a deploy state,
+// raw otherwise.
+func processFail(err error) (*mcp.CallToolResult, error) {
+	if r := processUnavailable(err); r != nil {
+		return r, nil
+	}
+	return nil, err
+}
+
+// recipeArg reads `recipe` as a string or a JSON number: process_screen
+// returns recipe_id as an integer, so agents send it back as one.
+func recipeArg(req mcp.CallToolRequest) string {
+	switch v := req.GetArguments()["recipe"].(type) {
+	case string:
+		return v
+	case float64:
+		return strconv.FormatInt(int64(v), 10)
+	}
+	return ""
+}
+
+type resolvedRecipe struct {
+	RecipeID int
+	Name     string
+}
+
 // resolveRecipe takes a numeric recipe_id or a name: exact match first, then
 // the shortest name containing it.
-func resolveRecipe(ctx context.Context, pool *pgxpool.Pool, nameOrID string) (int, *mcp.CallToolResult, error) {
+func resolveRecipe(ctx context.Context, pool *pgxpool.Pool, nameOrID string) (*resolvedRecipe, *mcp.CallToolResult, error) {
 	nameOrID = strings.TrimSpace(nameOrID)
 	if nameOrID == "" {
-		return 0, mcp.NewToolResultError(envelope.ErrorJSON("bad_param", "recipe must be a recipe_id or a name")), nil
+		return nil, mcp.NewToolResultError(envelope.ErrorJSON("bad_param", "recipe must be a recipe_id (e.g. 150) or a recipe name")), nil
 	}
-	var id int
+	var r resolvedRecipe
 	var err error
-	if n, convErr := strconv.Atoi(nameOrID); convErr == nil {
-		err = pool.QueryRow(ctx, `SELECT recipe_id FROM process_recipes WHERE recipe_id = $1`, n).Scan(&id)
+	if n, convErr := strconv.ParseInt(nameOrID, 10, 32); convErr == nil {
+		err = pool.QueryRow(ctx, `SELECT recipe_id, name FROM process_recipes WHERE recipe_id = $1`, n).Scan(&r.RecipeID, &r.Name)
+	} else if errors.Is(convErr, strconv.ErrRange) {
+		err = pgx.ErrNoRows // numeric but outside int4: no such id
 	} else {
 		err = pool.QueryRow(ctx, `
-			SELECT recipe_id FROM process_recipes
+			SELECT recipe_id, name FROM process_recipes
 			WHERE lower(name) LIKE '%' || lower($1) || '%' ESCAPE '\'
 			ORDER BY (lower(name) = lower($2)) DESC, length(name), name
-			LIMIT 1`, escapeLike(nameOrID), nameOrID).Scan(&id)
+			LIMIT 1`, escapeLike(nameOrID), nameOrID).Scan(&r.RecipeID, &r.Name)
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
-		return 0, mcp.NewToolResultError(envelope.ErrorJSON("recipe_not_found", "no processing recipe matches "+nameOrID+"; find names with process_screen")), nil
+		return nil, mcp.NewToolResultError(envelope.ErrorJSON("recipe_not_found", "no processing recipe matches "+nameOrID+"; find names and ids with process_screen")), nil
 	}
 	if err != nil {
-		if r := processUnavailable(err); r != nil {
-			return 0, r, nil
-		}
-		return 0, nil, err
+		res, err := processFail(err)
+		return nil, res, err
 	}
-	return id, nil, nil
+	return &r, nil, nil
 }
 
 // processQuoteRow mirrors process_quotes_now. Numerics are *float64: NULL is
-// "unpriceable right now" (a leg had no traded side) and must reach the agent
-// as null, never 0.
+// "unpriceable right now" (a leg had no traded side) or, for gp_hr on
+// throughput=unknown recipes, "no rate"; it must reach the agent as null.
 type processQuoteRow struct {
-	RecipeID                int      `json:"recipe_id"`
-	Name                    string   `json:"name"`
-	Category                string   `json:"category"`
-	Throughput              string   `json:"throughput"`
-	MarginSlow              *float64 `json:"margin_slow"`
-	MarginInsta             *float64 `json:"margin_insta"`
-	GpHr                    *float64 `json:"gp_hr"`
-	GpHrInsta               *float64 `json:"gp_hr_insta"`
-	GpHrTheoretical         *float64 `json:"gp_hr_theoretical"`
-	ActionsPerHour          *float64 `json:"actions_per_hour"`
-	EffectiveActionsPerHour *float64 `json:"effective_actions_per_hour"`
-	LimitActionsPerHour     *float64 `json:"limit_actions_per_hour"`
-	MarketActionsPerHour    *float64 `json:"market_actions_per_hour"`
-	FeeGp                   float64  `json:"fee_gp"`
-	MissingLegs             int64    `json:"missing_legs"`
-	MaxLegAgeS              *int64   `json:"max_leg_age_s"`
+	RecipeID                     int      `json:"recipe_id"`
+	Name                         string   `json:"name"`
+	Category                     string   `json:"category"`
+	Throughput                   string   `json:"throughput"`
+	MarginSlow                   *float64 `json:"margin_slow"`
+	MarginInsta                  *float64 `json:"margin_insta"`
+	GpHr                         *float64 `json:"gp_hr"`
+	GpHrInsta                    *float64 `json:"gp_hr_insta"`
+	GpHrTheoretical              *float64 `json:"gp_hr_theoretical"`
+	ActionsPerHour               *float64 `json:"actions_per_hour"`
+	EffectiveActionsPerHour      *float64 `json:"effective_actions_per_hour"`
+	LimitActionsPerHour          *float64 `json:"limit_actions_per_hour"`
+	MarketActionsPerHour         *float64 `json:"market_actions_per_hour"`
+	EffectiveActionsPerHourInsta *float64 `json:"effective_actions_per_hour_insta"`
+	MarketActionsPerHourInsta    *float64 `json:"market_actions_per_hour_insta"`
+	FeeGp                        float64  `json:"fee_gp"`
+	MissingLegs                  int64    `json:"missing_legs"`
+	MissingLegsInsta             int64    `json:"missing_legs_insta"`
+	UnknownLimitLegs             int64    `json:"unknown_limit_legs"`
+	MaxLegAgeS                   *int64   `json:"max_leg_age_s"`
 }
 
 const processQuoteCols = `recipe_id, name, category, throughput, margin_slow, margin_insta, gp_hr,
   gp_hr_insta, gp_hr_theoretical, actions_per_hour, effective_actions_per_hour,
-  limit_actions_per_hour, market_actions_per_hour, fee_gp, missing_legs, max_leg_age_s`
+  limit_actions_per_hour, market_actions_per_hour, effective_actions_per_hour_insta,
+  market_actions_per_hour_insta, fee_gp, missing_legs, missing_legs_insta,
+  unknown_limit_legs, max_leg_age_s`
 
 func scanProcessQuote(row pgx.Row, extra ...any) (processQuoteRow, error) {
 	var r processQuoteRow
 	dest := append([]any{&r.RecipeID, &r.Name, &r.Category, &r.Throughput, &r.MarginSlow, &r.MarginInsta,
 		&r.GpHr, &r.GpHrInsta, &r.GpHrTheoretical, &r.ActionsPerHour, &r.EffectiveActionsPerHour,
-		&r.LimitActionsPerHour, &r.MarketActionsPerHour, &r.FeeGp, &r.MissingLegs, &r.MaxLegAgeS}, extra...)
+		&r.LimitActionsPerHour, &r.MarketActionsPerHour, &r.EffectiveActionsPerHourInsta,
+		&r.MarketActionsPerHourInsta, &r.FeeGp, &r.MissingLegs, &r.MissingLegsInsta,
+		&r.UnknownLimitLegs, &r.MaxLegAgeS}, extra...)
 	return r, row.Scan(dest...)
+}
+
+// windowParam parses `window` (default 7d, max 90d).
+func windowParam(req mcp.CallToolRequest) (time.Duration, *mcp.CallToolResult) {
+	window, errResult := durationParam(req, "window", "7d")
+	if errResult != nil {
+		return 0, errResult
+	}
+	if window > 90*24*time.Hour {
+		return 0, mcp.NewToolResultError(envelope.ErrorJSON("bad_param", "window: max 90d"))
+	}
+	return window, nil
+}
+
+// categoryParam reads the optional category substring filter, LIKE-escaped.
+func categoryParam(req mcp.CallToolRequest) *string {
+	c := strings.TrimSpace(req.GetString("category", ""))
+	if c == "" {
+		return nil
+	}
+	c = escapeLike(c)
+	return &c
 }
 
 // ---------------------------------------------------------------------------
@@ -120,7 +180,7 @@ var processSortCols = map[string]string{
 
 func NewProcessScreenTool() mcp.Tool {
 	return mcp.NewTool("process_screen",
-		mcp.WithDescription("Rank ALL processing recipes (player-time money-makers: planks, keels, hull parts, potions, fish crates, GWD breakdowns...) in one call by live gp/hr. margin_slow = buy inputs at low, sell outputs at high minus GE tax, minus NPC fee, per action; margin_insta = the reverse prices. gp_hr = margin_slow x effective_actions_per_hour, where effective = LEAST(player actions/hr, buy-limit rate, 24h market-volume rate); gp_hr_theoretical ignores the market (player speed only) and overstates thin items. A null margin with missing_legs > 0 means a leg has no traded side: unpriceable now, not zero. Skill/quest requirements are NOT curated; surface that caveat. Deep-dive one recipe with process_quote; trends with process_history / process_top."),
+		mcp.WithDescription("Rank ALL processing recipes (player-time money-makers: planks, keels, hull parts, potions, fish crates, GWD breakdowns...) in one call by live gp/hr. margin_slow = buy inputs at low, sell outputs at high minus GE tax, minus NPC fee, per action; margin_insta = the reverse prices. gp_hr = margin_slow x effective_actions_per_hour = LEAST(player actions/hr, buy-limit rate, 24h market-volume rate); gp_hr_insta uses the insta fill side's volume. gp_hr_theoretical is player speed only and overstates thin items. Null margin with missing_legs (slow) / missing_legs_insta > 0: a leg has no traded side (unpriceable now, not zero). throughput=unknown has no rate, so gp_hr is null: rank those with sort=margin_slow. unknown_limit_legs > 0: the limit cap is optimistic. Skill/quest requirements are NOT curated; read notes via process_quote and surface the caveat. History: process_history / process_top."),
 		mcp.WithString("category", mcp.Description("Optional substring filter on category, e.g. 'Hull', 'Herblore', 'Plank'")),
 		mcp.WithString("throughput", mcp.Enum("fixed", "volume_capped", "volume_bound", "unknown"), mcp.Description("Optional throughput-kind filter")),
 		mcp.WithString("sort", mcp.Enum("gp_hr", "gp_hr_insta", "gp_hr_theoretical", "margin_slow"), mcp.Description("Ranking column (default gp_hr)")),
@@ -130,11 +190,7 @@ func NewProcessScreenTool() mcp.Tool {
 
 func ProcessScreenHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		var category, throughput *string
-		if c := strings.TrimSpace(req.GetString("category", "")); c != "" {
-			c = escapeLike(c)
-			category = &c
-		}
+		var throughput *string
 		if t := req.GetString("throughput", ""); t != "" {
 			switch t {
 			case "fixed", "volume_capped", "volume_bound", "unknown":
@@ -147,14 +203,11 @@ func ProcessScreenHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 		if !ok {
 			return mcp.NewToolResultError(envelope.ErrorJSON("bad_param", "sort must be gp_hr, gp_hr_insta, gp_hr_theoretical or margin_slow")), nil
 		}
-		limit := min(max(req.GetInt("limit", 25), 1), 100)
+		limit := clampLimit(req.GetInt("limit", 25))
 
-		rows, err := pool.Query(ctx, sprintfSQL(processScreenSQL, sortCol), category, throughput, limit)
+		rows, err := pool.Query(ctx, sprintfSQL(processScreenSQL, sortCol), categoryParam(req), throughput, limit)
 		if err != nil {
-			if r := processUnavailable(err); r != nil {
-				return r, nil
-			}
-			return nil, err
+			return processFail(err)
 		}
 		defer rows.Close()
 		out := []processQuoteRow{}
@@ -167,7 +220,7 @@ func ProcessScreenHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 			out = append(out, r)
 		}
 		if err := rows.Err(); err != nil {
-			return nil, err
+			return processFail(err)
 		}
 
 		env := envelope.New(out, len(out))
@@ -184,14 +237,14 @@ func ProcessScreenHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 // ---------------------------------------------------------------------------
 
 const processRecipeSQL = `
-SELECT recipe_id, source, coalesce(relation_name, ''), coalesce(relation_direction, ''), coalesce(notes, '')
+SELECT source, coalesce(relation_name, ''), coalesce(relation_direction, ''), coalesce(notes, '')
 FROM process_recipes WHERE recipe_id = $1`
 
 const processLegsSQL = `
 SELECT side, item_id, name, qty, buy_limit,
        CASE side WHEN 'buy' THEN low ELSE high END AS price_slow,
        CASE side WHEN 'buy' THEN high ELSE low END AS price_insta,
-       extract(epoch FROM now() - CASE side WHEN 'buy' THEN low_time ELSE high_time END)::bigint AS age_s,
+       extract(epoch FROM now() - CASE side WHEN 'buy' THEN low_time ELSE high_time END)::bigint AS slow_age_s,
        CASE side WHEN 'buy' THEN low_vol_24h ELSE high_vol_24h END AS fill_volume_24h
 FROM process_legs_now WHERE recipe_id = $1
 ORDER BY side, item_id`
@@ -206,48 +259,55 @@ type processLeg struct {
 	BuyLimit      *int64   `json:"buy_limit"`
 	PriceSlow     *int64   `json:"price_slow"`
 	PriceInsta    *int64   `json:"price_insta"`
-	AgeS          *int64   `json:"age_s"`
+	SlowAgeS      *int64   `json:"slow_age_s"`
 	FillVolume24h *float64 `json:"fill_volume_24h"`
 }
 
 func NewProcessQuoteTool() mcp.Tool {
 	return mcp.NewTool("process_quote",
-		mcp.WithDescription("One processing recipe in detail: every leg (side buy/sell, qty per action (can be fractional: expected yields), buy_limit, price_slow/price_insta, age_s of the price used, fill_volume_24h = trades on the side a patient offer fills against) plus the same summary process_screen returns, and the recipe's source, notes and linked item_relations name if any. Use it to check which leg limits a recipe (a null buy_limit means the limit is unknown, so the limit rate ignores that leg and is optimistic)."),
+		mcp.WithDescription("One processing recipe in detail: every leg (side buy/sell, qty per action (can be fractional: expected yields), buy_limit, price_slow/price_insta, slow_age_s = age of the price_slow quote, fill_volume_24h = 24h trades on the side a patient offer fills against) plus the same summary process_screen returns, and the recipe's source, notes (corrections, caveats) and linked item_relations name if any. Use it to see which leg limits a recipe; a null buy_limit means the limit is unknown, so the limit rate ignores that leg and is optimistic."),
 		mcp.WithString("recipe", mcp.Required(), mcp.Description("recipe_id from process_screen, or a recipe name")),
 	)
 }
 
 func ProcessQuoteHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		id, errResult, err := resolveRecipe(ctx, pool, req.GetString("recipe", ""))
+		rec, errResult, err := resolveRecipe(ctx, pool, recipeArg(req))
 		if err != nil || errResult != nil {
 			return errResult, err
 		}
 
-		var source, relName, relDir, notes string
-		if err := pool.QueryRow(ctx, processRecipeSQL, id).Scan(&id, &source, &relName, &relDir, &notes); err != nil {
-			return nil, err
-		}
-		summary, err := scanProcessQuote(pool.QueryRow(ctx, processQuoteSQL, id))
+		// One read-only snapshot (and one now()) so the leg prices reproduce
+		// the summary even if a price row lands between the statements.
+		tx, err := pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
 		if err != nil {
 			return nil, err
 		}
+		defer tx.Rollback(ctx)
 
-		rows, err := pool.Query(ctx, processLegsSQL, id)
+		var source, relName, relDir, notes string
+		if err := tx.QueryRow(ctx, processRecipeSQL, rec.RecipeID).Scan(&source, &relName, &relDir, &notes); err != nil {
+			return processFail(err)
+		}
+		summary, err := scanProcessQuote(tx.QueryRow(ctx, processQuoteSQL, rec.RecipeID))
 		if err != nil {
-			return nil, err
+			return processFail(err)
+		}
+		rows, err := tx.Query(ctx, processLegsSQL, rec.RecipeID)
+		if err != nil {
+			return processFail(err)
 		}
 		defer rows.Close()
 		legs := []processLeg{}
 		for rows.Next() {
 			var l processLeg
-			if err := rows.Scan(&l.Side, &l.ItemID, &l.Name, &l.Qty, &l.BuyLimit, &l.PriceSlow, &l.PriceInsta, &l.AgeS, &l.FillVolume24h); err != nil {
+			if err := rows.Scan(&l.Side, &l.ItemID, &l.Name, &l.Qty, &l.BuyLimit, &l.PriceSlow, &l.PriceInsta, &l.SlowAgeS, &l.FillVolume24h); err != nil {
 				return nil, err
 			}
 			legs = append(legs, l)
 		}
 		if err := rows.Err(); err != nil {
-			return nil, err
+			return processFail(err)
 		}
 
 		env := envelope.New(legs, len(legs))
@@ -268,7 +328,8 @@ func ProcessQuoteHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 // ---------------------------------------------------------------------------
 
 // Bucket width comes from processBuckets (closed set) and is bound as an
-// interval parameter, never spliced.
+// interval parameter, never spliced. priced_hours = hours with a margin,
+// the same definition process_top uses.
 const processHistorySQL = `
 SELECT time_bucket($3::interval, ts) AS bucket,
        round(avg(margin_slow))  AS margin_slow,
@@ -282,7 +343,17 @@ FROM process_snapshots
 WHERE recipe_id = $1 AND ts >= $2
 GROUP BY 1 ORDER BY 1`
 
-var processBuckets = map[string]string{"1h": "1 hour", "6h": "6 hours", "1d": "1 day"}
+var processBuckets = map[string]struct {
+	interval string
+	width    time.Duration
+}{
+	"1h": {"1 hour", time.Hour},
+	"6h": {"6 hours", 6 * time.Hour},
+	"1d": {"1 day", 24 * time.Hour},
+}
+
+// maxHistoryBuckets keeps one tool result to a few hundred rows.
+const maxHistoryBuckets = 400
 
 type processHistoryRow struct {
 	Bucket                  time.Time `json:"bucket"`
@@ -297,39 +368,38 @@ type processHistoryRow struct {
 
 func NewProcessHistoryTool() mcp.Tool {
 	return mcp.NewTool("process_history",
-		mcp.WithDescription("Trend for ONE processing recipe from the hourly snapshots: per bucket the average margin_slow, margin_insta, gp_hr, gp_hr_insta and effective actions/hr, plus hours (snapshots in the bucket) and priced_hours (hours with a non-null margin). priced_hours < hours means the recipe was unpriceable for part of the bucket; averages cover priced hours only. History starts when the snapshot job first ran, so short windows may be all there is."),
+		mcp.WithDescription("Trend for ONE processing recipe from the hourly snapshots: per bucket the average margin_slow, margin_insta, gp_hr, gp_hr_insta and effective actions/hr, plus hours (snapshots in the bucket) and priced_hours (hours with a margin). Averages cover hours with a value; priced_hours < hours means the recipe was unpriceable part of the bucket. gp_hr stays null for throughput=unknown recipes (no rate): read margin_slow. History starts when the snapshot job first ran. At most 400 buckets per call (1h up to 16d, 6h up to 90d)."),
 		mcp.WithString("recipe", mcp.Required(), mcp.Description("recipe_id from process_screen, or a recipe name")),
-		mcp.WithString("window", mcp.Description("How far back, <n><h|d> (default 7d, max 90d)")),
+		mcp.WithString("window", mcp.Description("How far back, <n><m|h|d> (default 7d, max 90d)")),
 		mcp.WithString("bucket", mcp.Enum("1h", "6h", "1d"), mcp.Description("Bucket width (default 6h)")),
 	)
 }
 
 func ProcessHistoryHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		id, errResult, err := resolveRecipe(ctx, pool, req.GetString("recipe", ""))
+		rec, errResult, err := resolveRecipe(ctx, pool, recipeArg(req))
 		if err != nil || errResult != nil {
 			return errResult, err
 		}
-		window, errResult := durationParam(req, "window", "7d")
+		window, errResult := windowParam(req)
 		if errResult != nil {
 			return errResult, nil
 		}
-		if window > 90*24*time.Hour {
-			return mcp.NewToolResultError(envelope.ErrorJSON("bad_param", "window: max 90d")), nil
-		}
-		bucket, ok := processBuckets[req.GetString("bucket", "6h")]
+		bucketKey := req.GetString("bucket", "6h")
+		bucket, ok := processBuckets[bucketKey]
 		if !ok {
 			return mcp.NewToolResultError(envelope.ErrorJSON("bad_param", "bucket must be 1h, 6h or 1d")), nil
+		}
+		if window/bucket.width > maxHistoryBuckets {
+			return mcp.NewToolResultError(envelope.ErrorJSON("bad_param",
+				"window/bucket exceeds 400 buckets: use bucket=1h up to 16d, bucket=6h up to 90d")), nil
 		}
 		to := time.Now().UTC()
 		from := to.Add(-window)
 
-		rows, err := pool.Query(ctx, processHistorySQL, id, from, bucket)
+		rows, err := pool.Query(ctx, processHistorySQL, rec.RecipeID, from, bucket.interval)
 		if err != nil {
-			if r := processUnavailable(err); r != nil {
-				return r, nil
-			}
-			return nil, err
+			return processFail(err)
 		}
 		defer rows.Close()
 		out := []processHistoryRow{}
@@ -341,12 +411,12 @@ func ProcessHistoryHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 			out = append(out, r)
 		}
 		if err := rows.Err(); err != nil {
-			return nil, err
+			return processFail(err)
 		}
 
 		env := envelope.New(out, len(out))
 		env.DataWindow = &envelope.Window{From: from, To: to}
-		env.Meta = map[string]any{"recipe_id": id}
+		env.Meta = map[string]any{"recipe_id": rec.RecipeID, "name": rec.Name, "bucket": bucketKey}
 		if len(out) == 0 {
 			env.Note = "no snapshots in this window: the ingester writes one per recipe per hour, so history may not have started yet"
 		}
@@ -360,16 +430,19 @@ func ProcessHistoryHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 
 // %s is a metric column from processTopMetrics (closed Go-side set). The
 // per-hour rank runs across ALL recipes before the category filter, so
-// hours_in_top10 means top 10 of the whole universe.
+// hours_in_top10 means top 10 of the whole universe. avg/median/p25 cover
+// hours with a metric value; $4 is the coverage floor (metric_hours / hours)
+// that keeps a mostly-unpriceable recipe from ranking on a few good hours.
 const processTopSQL = `
 WITH s AS (
-  SELECT recipe_id, ts, %s AS v,
+  SELECT recipe_id, ts, margin_slow, %s AS v,
          rank() OVER (PARTITION BY ts ORDER BY %[1]s DESC NULLS LAST) AS rk
   FROM process_snapshots WHERE ts >= $1
 )
 SELECT s.recipe_id, p.name, p.category,
-       count(*)   AS hours,
-       count(s.v) AS priced_hours,
+       count(*)             AS hours,
+       count(s.margin_slow) AS priced_hours,
+       count(s.v)           AS metric_hours,
        round(avg(s.v)) AS avg,
        round(percentile_cont(0.5)  WITHIN GROUP (ORDER BY s.v)::numeric) AS median,
        round(percentile_cont(0.25) WITHIN GROUP (ORDER BY s.v)::numeric) AS p25,
@@ -379,6 +452,7 @@ SELECT s.recipe_id, p.name, p.category,
 FROM s JOIN process_recipes p USING (recipe_id)
 WHERE ($2::text IS NULL OR p.category ILIKE '%%' || $2 || '%%')
 GROUP BY s.recipe_id, p.name, p.category
+HAVING count(s.v) >= $4::numeric / 100 * count(*)
 ORDER BY median DESC NULLS LAST, s.recipe_id
 LIMIT $3`
 
@@ -394,6 +468,7 @@ type processTopRow struct {
 	Category         string   `json:"category"`
 	Hours            int64    `json:"hours"`
 	PricedHours      int64    `json:"priced_hours"`
+	MetricHours      int64    `json:"metric_hours"`
 	Avg              *float64 `json:"avg"`
 	Median           *float64 `json:"median"`
 	P25              *float64 `json:"p25"`
@@ -404,61 +479,61 @@ type processTopRow struct {
 
 func NewProcessTopTool() mcp.Tool {
 	return mcp.NewTool("process_top",
-		mcp.WithDescription("Top processing recipes over a window, from the hourly snapshots, ranked by MEDIAN of the metric (robust to one-hour spikes). Per recipe: avg, median, p25 (a bad-hour floor), pct_hours_positive, hours_in_top10 (hours it ranked top 10 of ALL recipes), and avg_last_24h vs avg to spot a recipe that's rising or fading. Prefer recipes with a high p25 and pct_hours_positive near 100 (unpriced hours count as not positive): consistently good beats occasionally great. priced_hours < hours means some hours had an unpriceable leg."),
-		mcp.WithString("window", mcp.Description("How far back, <n><h|d> (default 7d, max 90d)")),
+		mcp.WithDescription("Top processing recipes over a window, from the hourly snapshots, ranked by MEDIAN of the metric (robust to one-hour spikes). Per recipe: hours, priced_hours (hours with a margin), metric_hours (hours with a metric value), avg / median / p25 over metric_hours, pct_hours_positive (of ALL hours), hours_in_top10 (hours ranked top 10 of ALL recipes), avg_last_24h vs avg (rising or fading). Recipes with the metric in fewer than min_coverage_pct of hours are left out. Prefer a high p25 with pct_hours_positive near 100: consistently good beats occasionally great. throughput=unknown recipes have no gp_hr: use metric=margin_slow. margin_slow ignores volume, so a frozen stale leg looks consistent: confirm with process_quote's slow_age_s."),
+		mcp.WithString("window", mcp.Description("How far back, <n><m|h|d> (default 7d, max 90d)")),
 		mcp.WithString("metric", mcp.Enum("gp_hr", "gp_hr_insta", "margin_slow"), mcp.Description("Metric to rank on (default gp_hr)")),
 		mcp.WithString("category", mcp.Description("Optional substring filter on category")),
+		mcp.WithNumber("min_coverage_pct", mcp.Description("Minimum % of hours with a metric value (default 50, 0-100)")),
 		mcp.WithNumber("limit", mcp.Description("Rows (default 20, max 100)")),
 	)
 }
 
 func ProcessTopHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 	return func(ctx context.Context, req mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-		window, errResult := durationParam(req, "window", "7d")
+		window, errResult := windowParam(req)
 		if errResult != nil {
 			return errResult, nil
-		}
-		if window > 90*24*time.Hour {
-			return mcp.NewToolResultError(envelope.ErrorJSON("bad_param", "window: max 90d")), nil
 		}
 		metric, ok := processTopMetrics[req.GetString("metric", "gp_hr")]
 		if !ok {
 			return mcp.NewToolResultError(envelope.ErrorJSON("bad_param", "metric must be gp_hr, gp_hr_insta or margin_slow")), nil
 		}
-		var category *string
-		if c := strings.TrimSpace(req.GetString("category", "")); c != "" {
-			c = escapeLike(c)
-			category = &c
+		coverage := req.GetInt("min_coverage_pct", 50)
+		if coverage < 0 || coverage > 100 {
+			return mcp.NewToolResultError(envelope.ErrorJSON("bad_param", "min_coverage_pct must be 0-100")), nil
 		}
-		limit := min(max(req.GetInt("limit", 20), 1), 100)
+		category := categoryParam(req)
+		limit := clampLimit(req.GetInt("limit", 20))
 		to := time.Now().UTC()
 		from := to.Add(-window)
 
-		rows, err := pool.Query(ctx, sprintfSQL(processTopSQL, metric), from, category, limit)
+		rows, err := pool.Query(ctx, sprintfSQL(processTopSQL, metric), from, category, limit, coverage)
 		if err != nil {
-			if r := processUnavailable(err); r != nil {
-				return r, nil
-			}
-			return nil, err
+			return processFail(err)
 		}
 		defer rows.Close()
 		out := []processTopRow{}
 		for rows.Next() {
 			var r processTopRow
-			if err := rows.Scan(&r.RecipeID, &r.Name, &r.Category, &r.Hours, &r.PricedHours, &r.Avg, &r.Median, &r.P25, &r.PctHoursPositive, &r.HoursInTop10, &r.AvgLast24h); err != nil {
+			if err := rows.Scan(&r.RecipeID, &r.Name, &r.Category, &r.Hours, &r.PricedHours, &r.MetricHours, &r.Avg,
+				&r.Median, &r.P25, &r.PctHoursPositive, &r.HoursInTop10, &r.AvgLast24h); err != nil {
 				return nil, err
 			}
 			out = append(out, r)
 		}
 		if err := rows.Err(); err != nil {
-			return nil, err
+			return processFail(err)
 		}
 
 		env := envelope.New(out, len(out))
 		env.DataWindow = &envelope.Window{From: from, To: to}
-		env.Meta = map[string]any{"metric": metric}
+		env.Meta = map[string]any{"metric": metric, "min_coverage_pct": coverage}
 		if len(out) == 0 {
-			env.Note = "no snapshots in this window: the ingester writes one per recipe per hour, so history may not have started yet"
+			if category != nil {
+				env.Note = "no recipes in this category met the coverage floor in this window"
+			} else {
+				env.Note = "no recipes met the coverage floor in this window: history may not have started yet (one snapshot per recipe per hour), or lower min_coverage_pct"
+			}
 		}
 		return mcp.NewToolResultText(env.JSON()), nil
 	}
