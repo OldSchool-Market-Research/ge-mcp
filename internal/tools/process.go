@@ -252,7 +252,7 @@ ORDER BY side, item_id`
 const processQuoteSQL = `SELECT ` + processQuoteCols + ` FROM process_quotes_now WHERE recipe_id = $1`
 
 type processLeg struct {
-	Side          string   `json:"side"`
+	Side string `json:"side"`
 	// pointers: init/06 treats a leg with a missing item_id or qty as an
 	// unpriceable recipe, not an error, so it must scan rather than fail the run
 	ItemID        *int     `json:"item_id"`
