@@ -51,7 +51,8 @@ func (e *Envelope) JSON() string {
 }
 
 // ToolError is the typed-error contract (DESIGN §5): bad input only, never
-// "nothing traded". Codes: item_not_found, bad_param.
+// "nothing traded". Codes: item_not_found, recipe_not_found, bad_param,
+// relations_unavailable, process_unavailable.
 type ToolError struct {
 	Code   string `json:"code"`
 	Reason string `json:"reason"`

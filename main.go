@@ -52,6 +52,11 @@ func main() {
 	s.AddTool(tools.NewListRelationsTool(), tools.ListRelationsHandler(pool))
 	s.AddTool(tools.NewComboScreenTool(), tools.ComboScreenHandler(pool))
 	s.AddTool(tools.NewComboQuoteTool(), tools.ComboQuoteHandler(pool))
+	// Processing recipes (player-time money-makers, ranked by gp/hr)
+	s.AddTool(tools.NewProcessScreenTool(), tools.ProcessScreenHandler(pool))
+	s.AddTool(tools.NewProcessQuoteTool(), tools.ProcessQuoteHandler(pool))
+	s.AddTool(tools.NewProcessHistoryTool(), tools.ProcessHistoryHandler(pool))
+	s.AddTool(tools.NewProcessTopTool(), tools.ProcessTopHandler(pool))
 	// Ship-time sizing (lanes F/B)
 	s.AddTool(tools.NewFlipQuoteTool(), tools.FlipQuoteHandler(pool))
 
