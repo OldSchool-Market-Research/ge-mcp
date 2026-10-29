@@ -253,9 +253,11 @@ const processQuoteSQL = `SELECT ` + processQuoteCols + ` FROM process_quotes_now
 
 type processLeg struct {
 	Side          string   `json:"side"`
-	ItemID        int      `json:"item_id"`
+	// pointers: init/06 treats a leg with a missing item_id or qty as an
+	// unpriceable recipe, not an error, so it must scan rather than fail the run
+	ItemID        *int     `json:"item_id"`
 	Name          *string  `json:"name"`
-	Qty           float64  `json:"qty"`
+	Qty           *float64 `json:"qty"`
 	BuyLimit      *int64   `json:"buy_limit"`
 	PriceSlow     *int64   `json:"price_slow"`
 	PriceInsta    *int64   `json:"price_insta"`
@@ -479,7 +481,7 @@ type processTopRow struct {
 
 func NewProcessTopTool() mcp.Tool {
 	return mcp.NewTool("process_top",
-		mcp.WithDescription("Top processing recipes over a window, from the hourly snapshots, ranked by MEDIAN of the metric (robust to one-hour spikes). Per recipe: hours, priced_hours (hours with a margin), metric_hours (hours with a metric value), avg / median / p25 over metric_hours, pct_hours_positive (of ALL hours), hours_in_top10 (hours ranked top 10 of ALL recipes), avg_last_24h vs avg (rising or fading). Recipes with the metric in fewer than min_coverage_pct of hours are left out. Prefer a high p25 with pct_hours_positive near 100: consistently good beats occasionally great. throughput=unknown recipes have no gp_hr: use metric=margin_slow. margin_slow ignores volume, so a frozen stale leg looks consistent: confirm with process_quote's slow_age_s."),
+		mcp.WithDescription("Top processing recipes over a window, from the hourly snapshots, ranked by MEDIAN of the metric (robust to one-hour spikes). Per recipe: hours, priced_hours (hours with a margin), metric_hours (hours with a metric value), avg / median / p25 over metric_hours, pct_hours_positive (of ALL hours), hours_in_top10 (hours ranked top 10 of ALL recipes), avg_last_24h vs avg (rising or fading). Recipes no longer in the catalog are omitted. Recipes with the metric in fewer than min_coverage_pct of hours are left out. Prefer a high p25 with pct_hours_positive near 100: consistently good beats occasionally great. throughput=unknown recipes have no gp_hr: use metric=margin_slow. margin_slow ignores volume, so a frozen stale leg looks consistent: confirm with process_quote's slow_age_s."),
 		mcp.WithString("window", mcp.Description("How far back, <n><m|h|d> (default 7d, max 90d)")),
 		mcp.WithString("metric", mcp.Enum("gp_hr", "gp_hr_insta", "margin_slow"), mcp.Description("Metric to rank on (default gp_hr)")),
 		mcp.WithString("category", mcp.Description("Optional substring filter on category")),

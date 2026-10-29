@@ -256,7 +256,8 @@ Consistent performers over a window from `process_snapshots`, ranked by median.
 - **Returns per row:** `recipe_id, name, category, hours, priced_hours` (hours with a
   margin, as in `process_history`), `metric_hours` (hours with the metric),
   `avg, median, p25` (over metric_hours), `pct_hours_positive` (of all hours),
-  `hours_in_top10` (per-hour rank across ALL recipes), `avg_last_24h`
+  `hours_in_top10` (per-hour rank across ALL recipes), `avg_last_24h`. Snapshots of
+  recipes since removed from `process_recipes` are omitted (the join drops them).
 
 ### Evidence
 
