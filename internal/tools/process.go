@@ -3,6 +3,8 @@ package tools
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"time"
@@ -312,8 +314,13 @@ func ProcessQuoteHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 			return processFail(err)
 		}
 
+		var persist processPersistence
+		if err := tx.QueryRow(ctx, processPersistenceSQL, rec.RecipeID, processFloorGpHr).Scan(&persist.Hours, &persist.AtFloor); err != nil {
+			return processFail(err)
+		}
+
 		env := envelope.New(legs, len(legs))
-		env.Meta = map[string]any{"summary": summary, "source": source, "harness": harnessQuote(summary, legs, relName != "")}
+		env.Meta = map[string]any{"summary": summary, "source": source, "harness": harnessQuote(summary, legs, relName != "", persist)}
 		if relName != "" {
 			env.Meta["relation_name"] = relName
 			env.Meta["relation_direction"] = relDir
@@ -330,6 +337,8 @@ func ProcessQuoteHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 //
 //	participation 0.15, slippage 0.005 -> ge-orchestrator internal/eval/eval.go
 //	floor 250k gp/hr, budget 50M       -> internal/eval/process.go, brief.Defaults
+//	12 hours, 80% at the floor         -> internal/runner/vet.go
+//	6h leg age                         -> internal/eval/combo.go
 //
 // Change any of those there and this must move in the same PR train.
 const (
@@ -337,26 +346,63 @@ const (
 	processSlippage      = 0.005
 	processFloorGpHr     = 250_000
 	processBudgetGp      = 50_000_000
+	processMinHours      = 12
+	processMinAtFloor    = 0.8
+	processMaxLegAgeS    = 6 * 3600
 )
+
+// processPersistenceSQL counts the trailing 24h's hourly snapshots: how many exist,
+// and how many paid the floor. A spike one hour doesn't make a recipe worth shipping.
+const processPersistenceSQL = `
+SELECT count(*), count(*) FILTER (WHERE gp_hr >= $2)
+FROM process_snapshots WHERE recipe_id = $1 AND ts > now() - interval '24 hours'`
+
+type processPersistence struct{ Hours, AtFloor int }
 
 // processHarness is what the orchestrator will compute for a lane-P pitch. The
 // view's gp_hr assumes 100% of market volume and exact prices, which the harness
 // doesn't: Making Anguish Uncut reads 3.2M there and about 159k here. Nulls are
-// signal: an unpriceable recipe has null numbers, never zero.
+// signal: an unpriceable recipe has null numbers, never zero. The numbers a strategy
+// copies are integers: submit_report's schema takes nothing else, and the client
+// rejects the whole call on a miss.
 type processHarness struct {
-	EntryPerAction *float64 `json:"entry_per_action"` // input cost + fee; the strategy's entry_price
-	ExitPerAction  *float64 `json:"exit_per_action"`  // post-tax output; the strategy's exit_price
-	MarginHaircut  *float64 `json:"margin_haircut"`   // margin_slow minus slippage both sides
-	ActionsPerHour *float64 `json:"actions_per_hour"` // min(player, buy limit, 15% of market, budget)
-	GpHr           *float64 `json:"gp_hr"`            // what realized pace is judged against
-	UnitsPer4h     *int64   `json:"units_per_4h"`     // the strategy's size.units_used
-	ClearsFloor    bool     `json:"clears_p_floor"`
-	Shippable      bool     `json:"shippable"`
-	Why            string   `json:"why,omitempty"` // why not shippable
+	EntryPerAction  *int64   `json:"entry_per_action"`   // input cost + fee; the strategy's entry_price
+	ExitPerAction   *int64   `json:"exit_per_action"`    // post-tax output; the strategy's exit_price
+	MarginHaircut   *float64 `json:"margin_haircut"`     // margin_slow minus slippage both sides
+	ActionsPerHour  *float64 `json:"actions_per_hour"`   // units_per_4h / 4
+	GpHr            *int64   `json:"gp_hr"`              // what realized pace is judged against
+	UnitsPer4h      *int64   `json:"units_per_4h"`       // min(player, buy limit, 15% of market, budget) x 4; the strategy's size.units_used
+	OutputItem      *int64   `json:"output_item"`        // the recipe's main output; the strategy's items[0]
+	Hours24h        int      `json:"hours_24h"`          // hourly snapshots in the last 24h
+	HoursAtFloor24h int      `json:"hours_at_floor_24h"` // how many of those read at least the floor
+	MaxLegAgeS      *int64   `json:"max_leg_age_s"`      // oldest leg's last trade
+	ClearsFloor     bool     `json:"clears_p_floor"`
+	Shippable       bool     `json:"shippable"`
+	Why             string   `json:"why,omitempty"` // why not shippable
 }
 
-func harnessQuote(q processQuoteRow, legs []processLeg, linked bool) processHarness {
-	var h processHarness
+// mainOutput is the sell leg the recipe makes most of, lowest id on a tie: the same
+// pick as the orchestrator's sweep, so a strategy and its signal name one item.
+func mainOutput(legs []processLeg) *int64 {
+	var best *processLeg
+	for i := range legs {
+		l := &legs[i]
+		if l.Side != "sell" || l.Qty == nil || l.ItemID == nil {
+			continue
+		}
+		if best == nil || *l.Qty > *best.Qty || (*l.Qty == *best.Qty && *l.ItemID < *best.ItemID) {
+			best = l
+		}
+	}
+	if best == nil {
+		return nil
+	}
+	id := int64(*best.ItemID)
+	return &id
+}
+
+func harnessQuote(q processQuoteRow, legs []processLeg, linked bool, p processPersistence) processHarness {
+	h := processHarness{OutputItem: mainOutput(legs), Hours24h: p.Hours, HoursAtFloor24h: p.AtFloor, MaxLegAgeS: q.MaxLegAgeS}
 	switch {
 	case linked:
 		h.Why = "this recipe is a C relation: ship it through lane C with combo_quote"
@@ -385,9 +431,10 @@ func harnessQuote(q processQuoteRow, legs []processLeg, linked bool) processHarn
 		}
 		return h
 	}
-	entry := in + q.FeeGp
-	exit := entry + *q.MarginSlow
-	margin := *q.MarginSlow - processSlippage*(in+out)
+	rawEntry := in + q.FeeGp
+	entry := int64(math.Round(rawEntry))
+	exit := int64(math.Round(rawEntry + *q.MarginSlow))
+	margin := math.Round((*q.MarginSlow-processSlippage*(in+out))*100) / 100
 	rate := processParticipation * *q.MarketActionsPerHour
 	if budget := processBudgetGp / in / 4; budget < rate {
 		rate = budget
@@ -397,15 +444,26 @@ func harnessQuote(q processQuoteRow, legs []processLeg, linked bool) processHarn
 			rate = *bound
 		}
 	}
-	gp := margin * rate
+	// Whole actions per 4h, as the orchestrator sizes it from size.units_used.
 	units := int64(rate * 4)
+	perHour := float64(units) / 4
+	gp := int64((*q.MarginSlow - processSlippage*(in+out)) * perHour)
 	h.EntryPerAction, h.ExitPerAction, h.MarginHaircut = &entry, &exit, &margin
-	h.ActionsPerHour, h.GpHr, h.UnitsPer4h = &rate, &gp, &units
+	h.ActionsPerHour, h.GpHr, h.UnitsPer4h = &perHour, &gp, &units
 	h.ClearsFloor = gp >= processFloorGpHr
-	h.Shippable = h.Why == "" && h.ClearsFloor
-	if h.Why == "" && !h.ClearsFloor {
-		h.Why = "under the 250k gp/hr floor at honest size"
+	if h.Why == "" {
+		switch {
+		case !h.ClearsFloor:
+			h.Why = "under the 250k gp/hr floor at honest size"
+		case q.MaxLegAgeS != nil && *q.MaxLegAgeS > processMaxLegAgeS:
+			h.Why = "a leg hasn't traded in over 6h, so its price can't be trusted"
+		case p.Hours < processMinHours:
+			h.Why = fmt.Sprintf("only %d hourly snapshots in the last 24h, under the %d the gate needs", p.Hours, processMinHours)
+		case float64(p.AtFloor) < processMinAtFloor*float64(p.Hours):
+			h.Why = fmt.Sprintf("read at the floor in only %d of the last %d hourly snapshots, under the gate of 80%%", p.AtFloor, p.Hours)
+		}
 	}
+	h.Shippable = h.Why == ""
 	return h
 }
 

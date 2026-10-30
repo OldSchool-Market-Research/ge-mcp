@@ -238,7 +238,11 @@ one REPEATABLE READ snapshot so the legs reproduce the summary.
 - **Returns:** one row per leg (`side, item_id, name, qty` (may be fractional),
   `buy_limit, price_slow, price_insta, slow_age_s, fill_volume_24h`) + `meta.summary`,
   `meta.source` (sheet row), `meta.relation_name/relation_direction` when the legs
-  come from `item_relations`, `meta.notes`
+  come from `item_relations`, `meta.notes`, and `meta.harness`: the orchestrator's own
+  lane-P arithmetic (`entry_per_action, exit_per_action, gp_hr, units_per_4h` as
+  integers, because a strategy copies them; `margin_haircut, actions_per_hour,
+  output_item, hours_24h, hours_at_floor_24h, max_leg_age_s, clears_p_floor, shippable,
+  why`). `shippable` is the vet's whole test, persistence and leg age included
 
 #### `process_history`
 One recipe's trend from `process_snapshots`.
