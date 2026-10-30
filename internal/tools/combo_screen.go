@@ -28,9 +28,10 @@ const maxComboScreenIDs = 50
 // as DISTINCT ON — the outer LEFT JOIN keeps null legs signal.
 const comboScreenSQL = `
 WITH rel AS (
-  SELECT relation_id, kind, name, reversible FROM item_relations
+  SELECT relation_id, kind, family, name, reversible FROM item_relations
   WHERE ($1::text IS NULL OR kind = $1)
     AND ($2::int[] IS NULL OR relation_id = ANY($2))
+    AND ($3::text IS NULL OR family = $3)
 ),
 legs AS (
   SELECT rel.relation_id, (l->>'item_id')::int AS item_id, (l->>'qty')::bigint AS qty, 'buy' AS side
@@ -65,7 +66,7 @@ act AS (
     AND ts > now() - interval '24 hours'
   GROUP BY item_id
 )
-SELECT leg.relation_id, rel.kind, rel.name, rel.reversible,
+SELECT leg.relation_id, rel.kind, rel.family, rel.name, rel.reversible,
        leg.side, leg.qty, i.buy_limit,
        CASE WHEN leg.side='buy' THEN l1.low ELSE l1.high END AS price,
        CASE WHEN leg.side='sell' AND l1.high IS NOT NULL
@@ -82,10 +83,11 @@ LEFT JOIN act a USING (item_id)
 ORDER BY leg.relation_id, leg.side`
 
 type comboScreenRow struct {
-	RelationID int    `json:"relation_id"`
-	Kind       string `json:"kind"`
-	Name       string `json:"name"`
-	Reversible bool   `json:"reversible"`
+	RelationID int     `json:"relation_id"`
+	Kind       string  `json:"kind"`
+	Family     *string `json:"family"`
+	Name       string  `json:"name"`
+	Reversible bool    `json:"reversible"`
 
 	// Forward-direction summary, same math as combo_quote's meta.summary.
 	// combo_margin is NULL (with missing_legs > 0) when any leg has no traded
@@ -104,6 +106,7 @@ func NewComboScreenTool() mcp.Tool {
 	return mcp.NewTool("combo_screen",
 		mcp.WithDescription("Rank the ENTIRE archetype-C universe in ONE call: prices every item_relations row forward (buy inputs at `low`, sell outputs at `high` minus GE tax) and returns one summary row per relation, ranked by combo_margin (nulls last). Row shape matches combo_quote's meta.summary. Use this FIRST for C research — it replaces calling combo_quote once per relation — then deep-dive only the top few with combo_quote (per-leg detail, reverse direction, cadence-relative freshness). combo_margin null + missing_legs > 0 means a leg had no traded side: unpriceable right now, not zero. worst_leg_age_ratio <= ~3 is that leg's normal cadence, not staleness."),
 		mcp.WithString("kind", mcp.Enum("decant", "set", "combine"), mcp.Description("Only relations of this kind")),
+		mcp.WithString("family", mcp.Description("Only relations of this sub-type: barrows, moon, endgame, dragonhide, robes, metal (sets); dismantle, godsword, shield, boots, jewellery, repair, weapon, armour, misc (combines); restore, combat, utility (decants)")),
 		mcp.WithArray("relation_ids", mcp.Description("Only these relations (max 50); omit to screen all"), mcp.WithNumberItems()),
 		mcp.WithNumber("limit", mcp.Description("Rows returned after ranking (default 25, max 50); meta.screened says how many were priced")),
 	)
@@ -142,7 +145,7 @@ func ComboScreenHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 			return mcp.NewToolResultError(envelope.ErrorJSON("bad_param", fmt.Sprintf("limit must be 1-%d", maxComboScreenIDs))), nil
 		}
 
-		rows, err := pool.Query(ctx, comboScreenSQL, kind, relationIDs)
+		rows, err := pool.Query(ctx, comboScreenSQL, kind, relationIDs, familyParam(req))
 		if err != nil {
 			if errResult := relationsUnavailable(err); errResult != nil {
 				return errResult, nil
@@ -156,16 +159,17 @@ func ComboScreenHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 		for rows.Next() {
 			var relationID int
 			var kind, name, side string
+			var family *string
 			var reversible bool
 			var qty, tax int64
 			var buyLimit, price, ageS, vol5m, trades24h *int64
-			if err := rows.Scan(&relationID, &kind, &name, &reversible,
+			if err := rows.Scan(&relationID, &kind, &family, &name, &reversible,
 				&side, &qty, &buyLimit, &price, &tax, &ageS, &vol5m, &trades24h); err != nil {
 				return nil, err
 			}
 			r := byRelation[relationID]
 			if r == nil {
-				r = &comboScreenRow{RelationID: relationID, Kind: kind, Name: name, Reversible: reversible}
+				r = &comboScreenRow{RelationID: relationID, Kind: kind, Family: family, Name: name, Reversible: reversible}
 				byRelation[relationID] = r
 				order = append(order, relationID)
 			}

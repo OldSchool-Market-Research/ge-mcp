@@ -18,7 +18,7 @@ import (
 // Legs are enriched with names + buy limits from `items` at query time so
 // they can never drift from the seed's raw ids.
 const listRelationsSQL = `
-SELECT r.relation_id, r.kind, r.name, r.reversible, coalesce(r.notes, ''),
+SELECT r.relation_id, r.kind, r.family, r.name, r.reversible, coalesce(r.notes, ''),
   (SELECT jsonb_agg(jsonb_build_object(
       'item_id', (l->>'item_id')::int, 'qty', (l->>'qty')::int,
       'name', i.name, 'buy_limit', i.buy_limit))
@@ -31,6 +31,7 @@ SELECT r.relation_id, r.kind, r.name, r.reversible, coalesce(r.notes, ''),
    JOIN items i ON i.item_id = (l->>'item_id')::int) AS outputs
 FROM item_relations r
 WHERE ($1::text IS NULL OR r.kind = $1)
+  AND ($4::text IS NULL OR r.family = $4)
   AND ($2::int IS NULL OR r.inputs @> jsonb_build_array(jsonb_build_object('item_id', $2::int))
                        OR r.outputs @> jsonb_build_array(jsonb_build_object('item_id', $2::int))
                        OR EXISTS (SELECT 1 FROM jsonb_array_elements(r.inputs || r.outputs) l
@@ -38,15 +39,24 @@ WHERE ($1::text IS NULL OR r.kind = $1)
 ORDER BY r.kind, r.name
 LIMIT $3`
 
-// relationsUnavailable converts a missing item_relations table (42P01) into a
-// typed tool error instead of a fatal internal one: the table ships as a
+// relationsUnavailable converts a missing item_relations table (42P01) or column
+// (42703, this binary ahead of ge-data's family DDL) into a typed tool error
+// instead of a fatal internal one: the table ships as a
 // manual DDL apply separate from this binary, and a run must be able to note
 // "archetype C unavailable" and continue rather than die on the first call.
 func relationsUnavailable(err error) *mcp.CallToolResult {
 	var pgErr *pgconn.PgError
-	if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
+	if errors.As(err, &pgErr) && (pgErr.Code == "42P01" || pgErr.Code == "42703") {
 		return mcp.NewToolResultError(envelope.ErrorJSON("relations_unavailable",
-			"the item_relations table is not present in this database — archetype C is unavailable; note it and continue with the other archetypes"))
+			"item_relations or its family column is not present in this database — archetype C is unavailable; note it and continue with the other archetypes"))
+	}
+	return nil
+}
+
+// familyParam is the optional family filter, nil when absent.
+func familyParam(req mcp.CallToolRequest) *string {
+	if f := req.GetString("family", ""); f != "" {
+		return &f
 	}
 	return nil
 }
@@ -61,6 +71,7 @@ type relationLeg struct {
 type relationRow struct {
 	RelationID int           `json:"relation_id"`
 	Kind       string        `json:"kind"`
+	Family     *string       `json:"family"`
 	Name       string        `json:"name"`
 	Reversible bool          `json:"reversible"`
 	Notes      string        `json:"notes"`
@@ -72,6 +83,7 @@ func NewListRelationsTool() mcp.Tool {
 	return mcp.NewTool("list_relations",
 		mcp.WithDescription("The archetype-C universe: hand-curated mechanical conversions between tradeable items — potion decants (4<->3 dose), GE-clerk armour sets, combine recipes. Canonical direction is inputs bought -> outputs sold; reversible=true also works backwards (sets, godsword dismantling, decants either way). notes carry skill/quest gates and NPC fees — a conversion the player can't perform is not their edge; always surface them. Price a specific relation end-to-end with combo_quote."),
 		mcp.WithString("kind", mcp.Enum("decant", "set", "combine"), mcp.Description("Filter by relation kind; omit for all")),
+		mcp.WithString("family", mcp.Description("Filter by sub-type, finer than kind: barrows, moon, endgame, dragonhide, robes, metal (sets); dismantle, godsword, shield, boots, jewellery, repair, weapon, armour, misc (combines); restore, combat, utility (decants)")),
 		mcp.WithString("name_or_id", mcp.Description("Optional item filter: relations where this item appears on either side")),
 		mcp.WithNumber("limit", mcp.Description("Max rows (default 50)")),
 	)
@@ -107,7 +119,7 @@ func ListRelationsHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 			itemID = &res.ItemID
 		}
 
-		rows, err := pool.Query(ctx, listRelationsSQL, kind, itemID, limit)
+		rows, err := pool.Query(ctx, listRelationsSQL, kind, itemID, limit, familyParam(req))
 		if err != nil {
 			if errResult := relationsUnavailable(err); errResult != nil {
 				return errResult, nil
@@ -120,7 +132,7 @@ func ListRelationsHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 		for rows.Next() {
 			var r relationRow
 			var inputs, outputs []byte
-			if err := rows.Scan(&r.RelationID, &r.Kind, &r.Name, &r.Reversible, &r.Notes, &inputs, &outputs); err != nil {
+			if err := rows.Scan(&r.RelationID, &r.Kind, &r.Family, &r.Name, &r.Reversible, &r.Notes, &inputs, &outputs); err != nil {
 				return nil, err
 			}
 			if err := json.Unmarshal(inputs, &r.Inputs); err != nil {

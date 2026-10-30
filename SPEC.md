@@ -173,8 +173,8 @@ trigger runs the same computation (kept in sync by design).
 The curated conversion universe (`item_relations`: decants / sets / combines). Legs
 enriched with names + buy limits from `items` at query time; `notes` carry skill/quest
 gates and fees.
-- **Params:** `kind?, name_or_id?, limit=50`
-- **Returns per row:** `relation_id, kind, name, reversible, notes,
+- **Params:** `kind?, family?, name_or_id?, limit=50`
+- **Returns per row:** `relation_id, kind, family, name, reversible, notes,
   inputs[{item_id, qty, name, buy_limit}], outputs[...]`
 - **Backed by:** [QUERIES #20](./QUERIES.md#20-relations-listing--list_relations)
 
@@ -184,9 +184,9 @@ made 46 single `combo_quote` calls to do what this does once). Prices every
 `item_relations` row forward with `combo_quote`'s leg math and returns one summary row
 per relation, ranked `combo_margin DESC NULLS LAST`. A relation with an unpriced leg
 keeps `combo_margin` null + `missing_legs > 0` — unpriceable now, not zero.
-- **Params:** `kind?`, `relation_ids?` (max 50), `limit=25` (post-ranking;
+- **Params:** `kind?`, `family?`, `relation_ids?` (max 50), `limit=25` (post-ranking;
   `meta.screened` vs `meta.returned` says what the cap dropped — no silent truncation)
-- **Returns per row:** `relation_id, kind, name, reversible, input_cost,
+- **Returns per row:** `relation_id, kind, family, name, reversible, input_cost,
   output_revenue_post_tax, combo_margin, roi_pct, min_leg_vol5m, worst_leg_age_ratio,
   units_bound_per_4h, missing_legs`
 - **Backed by:** [QUERIES #21](./QUERIES.md#21-conversion-quote--combo_quote) batched
