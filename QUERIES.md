@@ -542,7 +542,8 @@ at query time — ids in the seed, names never stored, so they cannot drift. `no
 carry skill/quest gates and NPC fees; surfacing them is mandatory (a conversion the
 player can't perform is not their edge).
 - SQL: `internal/tools/relations.go`.
-- **→ tool:** `list_relations(kind?, name_or_id?, limit=50)`
+- **→ tool:** `list_relations(kind?, family?, name_or_id?, limit=50)`. `family` (ge-data
+  init/07, a sub-type finer than kind) is returned and filterable here and on `combo_screen`.
 
 ### 21. Conversion quote — `combo_quote`
 **Answers:** what does relation R pay end-to-end *right now*? Buy legs fill at latest
