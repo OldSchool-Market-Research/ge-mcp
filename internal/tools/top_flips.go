@@ -46,8 +46,9 @@ base AS (
          round(l.margin::numeric / nullif(l.low,0) * 100, 2)::float8 AS roi_pct,
          i.buy_limit,
          l.margin * i.buy_limit AS profit_per_limit,
-         l.margin * least(i.buy_limit, coalesce(liq.vol5m,0)) AS filled_profit,
-         l.margin * least(i.buy_limit * 6, floor(coalesce(v.vol24h,0) * 0.15)::bigint) AS gp_day,
+         -- least() skips a NULL, which would read an unknown limit as no limit
+         CASE WHEN i.buy_limit IS NOT NULL THEN l.margin * least(i.buy_limit, coalesce(liq.vol5m,0)) END AS filled_profit,
+         CASE WHEN i.buy_limit IS NOT NULL THEN l.margin * least(i.buy_limit * 6, floor(coalesce(v.vol24h,0) * 0.15)::bigint) END AS gp_day,
          extract(epoch from now() - l.high_time)::int AS high_age_s,
          extract(epoch from now() - l.low_time)::int  AS low_age_s,
          coalesce(liq.vol5m,0) AS vol5m,

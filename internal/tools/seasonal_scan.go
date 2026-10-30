@@ -74,7 +74,7 @@ SELECT a.item_id, i.name, i.buy_limit, i.members,
        round(s.tot_vol::numeric / s.tot_n)::bigint AS avg_vol5m,
        round(s.mean_mid::numeric)::bigint AS mean_price,
        round(((a.dear_idx - a.cheap_idx) * s.mean_mid
-              * least(i.buy_limit, floor((s.tot_vol::numeric / s.tot_n) * 36 * 0.15)))::numeric)::bigint AS gp_cycle,
+              * CASE WHEN i.buy_limit IS NOT NULL THEN least(i.buy_limit, floor((s.tot_vol::numeric / s.tot_n) * 36 * 0.15)) END)::numeric)::bigint AS gp_cycle,
        s.from_ts, s.to_ts
 FROM agg a
 JOIN item_stats s USING (item_id)

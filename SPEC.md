@@ -222,7 +222,8 @@ zero; `throughput=unknown` has no rate, so its `gp_hr` is null (rank on
 Rank the whole processing universe from `process_quotes_now` in one call.
 - **Params:** `category?` (substring), `throughput? ∈ fixed | volume_capped |
   volume_bound | unknown`, `sort ∈ gp_hr (default) | gp_hr_insta | gp_hr_theoretical
-  | margin_slow`, `limit=25` (max 100; `meta.screened` vs `meta.returned`)
+  | margin_slow`, `limit=25` (max 100; `meta.screened` vs `meta.returned`). A recipe
+  with an unknown buy limit ranks after every recipe without one
 - **Returns per row:** `recipe_id, name, category, throughput, margin_slow,
   margin_insta, gp_hr, gp_hr_insta, gp_hr_theoretical, actions_per_hour,
   effective_actions_per_hour, limit_actions_per_hour, market_actions_per_hour,
@@ -260,7 +261,9 @@ Consistent performers over a window from `process_snapshots`, ranked by median.
 - **Returns per row:** `recipe_id, name, category, hours, priced_hours` (hours with a
   margin, as in `process_history`), `metric_hours` (hours with the metric),
   `avg, median, p25` (over metric_hours), `pct_hours_positive` (of all hours),
-  `hours_in_top10` (per-hour rank across ALL recipes), `avg_last_24h`. Snapshots of
+  `hours_in_top10` (per-hour rank across ALL recipes), `avg_last_24h`,
+  `unknown_limit_legs` (latest hour). A recipe with an unknown buy limit ranks after
+  every recipe without one: its number ignores a cap nobody knows. Snapshots of
   recipes since removed from `process_recipes` are omitted (the join drops them).
 
 ### Evidence

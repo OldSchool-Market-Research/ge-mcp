@@ -170,7 +170,7 @@ SELECT ` + processQuoteCols + `, count(*) OVER () AS screened
 FROM process_quotes_now
 WHERE ($1::text IS NULL OR category ILIKE '%%' || $1 || '%%')
   AND ($2::text IS NULL OR throughput = $2)
-ORDER BY %s DESC NULLS LAST, recipe_id
+ORDER BY unknown_limit_legs > 0, %s DESC NULLS LAST, recipe_id
 LIMIT $3`
 
 var processSortCols = map[string]string{
@@ -579,7 +579,7 @@ func ProcessHistoryHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 // that keeps a mostly-unpriceable recipe from ranking on a few good hours.
 const processTopSQL = `
 WITH s AS (
-  SELECT recipe_id, ts, margin_slow, %s AS v,
+  SELECT recipe_id, ts, margin_slow, unknown_limit_legs, %s AS v,
          rank() OVER (PARTITION BY ts ORDER BY %[1]s DESC NULLS LAST) AS rk
   FROM process_snapshots WHERE ts >= $1
 )
@@ -592,12 +592,13 @@ SELECT s.recipe_id, p.name, p.category,
        round(percentile_cont(0.25) WITHIN GROUP (ORDER BY s.v)::numeric) AS p25,
        round(100.0 * count(*) FILTER (WHERE s.v > 0) / count(*), 1) AS pct_hours_positive,
        count(*) FILTER (WHERE s.rk <= 10 AND s.v IS NOT NULL) AS hours_in_top10,
-       round(avg(s.v) FILTER (WHERE s.ts >= now() - interval '24 hours')) AS avg_last_24h
+       round(avg(s.v) FILTER (WHERE s.ts >= now() - interval '24 hours')) AS avg_last_24h,
+       (array_agg(s.unknown_limit_legs ORDER BY s.ts DESC))[1] AS unknown_limit_legs
 FROM s JOIN process_recipes p USING (recipe_id)
 WHERE ($2::text IS NULL OR p.category ILIKE '%%' || $2 || '%%')
 GROUP BY s.recipe_id, p.name, p.category
 HAVING count(s.v) >= $4::numeric / 100 * count(*)
-ORDER BY median DESC NULLS LAST, s.recipe_id
+ORDER BY (array_agg(s.unknown_limit_legs ORDER BY s.ts DESC))[1] > 0, median DESC NULLS LAST, s.recipe_id
 LIMIT $3`
 
 var processTopMetrics = map[string]string{
@@ -619,6 +620,7 @@ type processTopRow struct {
 	PctHoursPositive *float64 `json:"pct_hours_positive"`
 	HoursInTop10     int64    `json:"hours_in_top10"`
 	AvgLast24h       *float64 `json:"avg_last_24h"`
+	UnknownLimitLegs int64    `json:"unknown_limit_legs"` // latest hour; over 0, the rate ignores a limit nobody knows
 }
 
 func NewProcessTopTool() mcp.Tool {
@@ -660,7 +662,7 @@ func ProcessTopHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 		for rows.Next() {
 			var r processTopRow
 			if err := rows.Scan(&r.RecipeID, &r.Name, &r.Category, &r.Hours, &r.PricedHours, &r.MetricHours, &r.Avg,
-				&r.Median, &r.P25, &r.PctHoursPositive, &r.HoursInTop10, &r.AvgLast24h); err != nil {
+				&r.Median, &r.P25, &r.PctHoursPositive, &r.HoursInTop10, &r.AvgLast24h, &r.UnknownLimitLegs); err != nil {
 				return nil, err
 			}
 			out = append(out, r)
