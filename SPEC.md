@@ -263,7 +263,8 @@ Consistent performers over a window from `process_snapshots`, ranked by median.
   `avg, median, p25` (over metric_hours), `pct_hours_positive` (of all hours),
   `hours_in_top10` (per-hour rank across ALL recipes), `avg_last_24h`,
   `unknown_limit_legs` (latest hour). A recipe with an unknown buy limit ranks after
-  every recipe without one: its number ignores a cap nobody knows. Snapshots of
+  every recipe without one, in this order and in `hours_in_top10`: lane P can't ship
+  it, and its gp/hr ignores a cap nobody knows. Snapshots of
   recipes since removed from `process_recipes` are omitted (the join drops them).
 
 ### Evidence
