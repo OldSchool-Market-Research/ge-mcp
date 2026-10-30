@@ -170,7 +170,7 @@ SELECT ` + processQuoteCols + `, count(*) OVER () AS screened
 FROM process_quotes_now
 WHERE ($1::text IS NULL OR category ILIKE '%%' || $1 || '%%')
   AND ($2::text IS NULL OR throughput = $2)
-ORDER BY %s DESC NULLS LAST, recipe_id
+ORDER BY unknown_limit_legs > 0, %s DESC NULLS LAST, recipe_id
 LIMIT $3`
 
 var processSortCols = map[string]string{
@@ -182,7 +182,7 @@ var processSortCols = map[string]string{
 
 func NewProcessScreenTool() mcp.Tool {
 	return mcp.NewTool("process_screen",
-		mcp.WithDescription("Rank ALL processing recipes (player-time money-makers: planks, keels, hull parts, potions, fish crates, GWD breakdowns...) in one call by live gp/hr. margin_slow = buy inputs at low, sell outputs at high minus GE tax, minus NPC fee, per action; margin_insta = the reverse prices. gp_hr = margin_slow x effective_actions_per_hour = LEAST(player actions/hr, buy-limit rate, 24h market-volume rate); gp_hr_insta uses the insta fill side's volume. gp_hr_theoretical is player speed only and overstates thin items. Null margin with missing_legs (slow) / missing_legs_insta > 0: a leg has no traded side (unpriceable now, not zero). throughput=unknown has no rate, so gp_hr is null: rank those with sort=margin_slow. unknown_limit_legs > 0: the limit cap is optimistic. Skill/quest requirements are NOT curated; read notes via process_quote and surface the caveat. History: process_history / process_top."),
+		mcp.WithDescription("Rank ALL processing recipes (player-time money-makers: planks, keels, hull parts, potions, fish crates, GWD breakdowns...) in one call by live gp/hr, with any recipe whose buy limit is unknown (unknown_limit_legs above 0) after every other, because lane P can't ship those. margin_slow = buy inputs at low, sell outputs at high minus GE tax, minus NPC fee, per action; margin_insta = the reverse prices. gp_hr = margin_slow x effective_actions_per_hour = LEAST(player actions/hr, buy-limit rate, 24h market-volume rate); gp_hr_insta uses the insta fill side's volume. gp_hr_theoretical is player speed only and overstates thin items. Null margin with missing_legs (slow) / missing_legs_insta > 0: a leg has no traded side (unpriceable now, not zero). throughput=unknown has no rate, so gp_hr is null: rank those with sort=margin_slow. unknown_limit_legs > 0: the limit cap is optimistic. Skill/quest requirements are NOT curated; read notes via process_quote and surface the caveat. History: process_history / process_top."),
 		mcp.WithString("category", mcp.Description("Optional substring filter on category, e.g. 'Hull', 'Herblore', 'Plank'")),
 		mcp.WithString("throughput", mcp.Enum("fixed", "volume_capped", "volume_bound", "unknown"), mcp.Description("Optional throughput-kind filter")),
 		mcp.WithString("sort", mcp.Enum("gp_hr", "gp_hr_insta", "gp_hr_theoretical", "margin_slow"), mcp.Description("Ranking column (default gp_hr)")),
@@ -579,8 +579,8 @@ func ProcessHistoryHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 // that keeps a mostly-unpriceable recipe from ranking on a few good hours.
 const processTopSQL = `
 WITH s AS (
-  SELECT recipe_id, ts, margin_slow, %s AS v,
-         rank() OVER (PARTITION BY ts ORDER BY %[1]s DESC NULLS LAST) AS rk
+  SELECT recipe_id, ts, margin_slow, unknown_limit_legs, %s AS v,
+         rank() OVER (PARTITION BY ts ORDER BY unknown_limit_legs > 0, %[1]s DESC NULLS LAST) AS rk
   FROM process_snapshots WHERE ts >= $1
 )
 SELECT s.recipe_id, p.name, p.category,
@@ -592,12 +592,13 @@ SELECT s.recipe_id, p.name, p.category,
        round(percentile_cont(0.25) WITHIN GROUP (ORDER BY s.v)::numeric) AS p25,
        round(100.0 * count(*) FILTER (WHERE s.v > 0) / count(*), 1) AS pct_hours_positive,
        count(*) FILTER (WHERE s.rk <= 10 AND s.v IS NOT NULL) AS hours_in_top10,
-       round(avg(s.v) FILTER (WHERE s.ts >= now() - interval '24 hours')) AS avg_last_24h
+       round(avg(s.v) FILTER (WHERE s.ts >= now() - interval '24 hours')) AS avg_last_24h,
+       (array_agg(s.unknown_limit_legs ORDER BY s.ts DESC))[1] AS unknown_limit_legs
 FROM s JOIN process_recipes p USING (recipe_id)
 WHERE ($2::text IS NULL OR p.category ILIKE '%%' || $2 || '%%')
 GROUP BY s.recipe_id, p.name, p.category
 HAVING count(s.v) >= $4::numeric / 100 * count(*)
-ORDER BY median DESC NULLS LAST, s.recipe_id
+ORDER BY (array_agg(s.unknown_limit_legs ORDER BY s.ts DESC))[1] > 0, median DESC NULLS LAST, s.recipe_id
 LIMIT $3`
 
 var processTopMetrics = map[string]string{
@@ -619,11 +620,12 @@ type processTopRow struct {
 	PctHoursPositive *float64 `json:"pct_hours_positive"`
 	HoursInTop10     int64    `json:"hours_in_top10"`
 	AvgLast24h       *float64 `json:"avg_last_24h"`
+	UnknownLimitLegs int64    `json:"unknown_limit_legs"` // latest hour; over 0, the rate ignores a limit nobody knows
 }
 
 func NewProcessTopTool() mcp.Tool {
 	return mcp.NewTool("process_top",
-		mcp.WithDescription("Top processing recipes over a window, from the hourly snapshots, ranked by MEDIAN of the metric (robust to one-hour spikes). Per recipe: hours, priced_hours (hours with a margin), metric_hours (hours with a metric value), avg / median / p25 over metric_hours, pct_hours_positive (of ALL hours), hours_in_top10 (hours ranked top 10 of ALL recipes), avg_last_24h vs avg (rising or fading). Recipes no longer in the catalog are omitted. Recipes with the metric in fewer than min_coverage_pct of hours are left out. Prefer a high p25 with pct_hours_positive near 100: consistently good beats occasionally great. throughput=unknown recipes have no gp_hr: use metric=margin_slow. margin_slow ignores volume, so a frozen stale leg looks consistent: confirm with process_quote's slow_age_s."),
+		mcp.WithDescription("Top processing recipes over a window, from the hourly snapshots, ranked by MEDIAN of the metric (robust to one-hour spikes), with any recipe whose buy limit is unknown (unknown_limit_legs above 0) after every other, because lane P can't ship those. Per recipe: hours, priced_hours (hours with a margin), metric_hours (hours with a metric value), avg / median / p25 over metric_hours, pct_hours_positive (of ALL hours), hours_in_top10 (hours ranked top 10 of ALL recipes), avg_last_24h vs avg (rising or fading). Recipes no longer in the catalog are omitted. Recipes with the metric in fewer than min_coverage_pct of hours are left out. Prefer a high p25 with pct_hours_positive near 100: consistently good beats occasionally great. throughput=unknown recipes have no gp_hr: use metric=margin_slow. margin_slow ignores volume, so a frozen stale leg looks consistent: confirm with process_quote's slow_age_s."),
 		mcp.WithString("window", mcp.Description("How far back, <n><m|h|d> (default 7d, max 90d)")),
 		mcp.WithString("metric", mcp.Enum("gp_hr", "gp_hr_insta", "margin_slow"), mcp.Description("Metric to rank on (default gp_hr)")),
 		mcp.WithString("category", mcp.Description("Optional substring filter on category")),
@@ -660,7 +662,7 @@ func ProcessTopHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 		for rows.Next() {
 			var r processTopRow
 			if err := rows.Scan(&r.RecipeID, &r.Name, &r.Category, &r.Hours, &r.PricedHours, &r.MetricHours, &r.Avg,
-				&r.Median, &r.P25, &r.PctHoursPositive, &r.HoursInTop10, &r.AvgLast24h); err != nil {
+				&r.Median, &r.P25, &r.PctHoursPositive, &r.HoursInTop10, &r.AvgLast24h, &r.UnknownLimitLegs); err != nil {
 				return nil, err
 			}
 			out = append(out, r)
