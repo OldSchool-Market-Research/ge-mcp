@@ -48,7 +48,7 @@ func relationsUnavailable(err error) *mcp.CallToolResult {
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && (pgErr.Code == "42P01" || pgErr.Code == "42703") {
 		return mcp.NewToolResultError(envelope.ErrorJSON("relations_unavailable",
-			"the item_relations table is not present in this database — archetype C is unavailable; note it and continue with the other archetypes"))
+			"item_relations or its family column is not present in this database — archetype C is unavailable; note it and continue with the other archetypes"))
 	}
 	return nil
 }
