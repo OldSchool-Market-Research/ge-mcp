@@ -267,7 +267,7 @@ type processLeg struct {
 
 func NewProcessQuoteTool() mcp.Tool {
 	return mcp.NewTool("process_quote",
-		mcp.WithDescription("One processing recipe in detail: every leg (side buy/sell, qty per action (can be fractional: expected yields), buy_limit, price_slow/price_insta, slow_age_s = age of the price_slow quote, fill_volume_24h = 24h trades on the side a patient offer fills against) plus the same summary process_screen returns, and the recipe's source, notes (corrections, caveats) and linked item_relations name if any. Use it to see which leg limits a recipe; a null buy_limit means the limit is unknown, so the limit rate ignores that leg and is optimistic."),
+		mcp.WithDescription("One processing recipe in detail: every leg (side buy/sell, qty per action (can be fractional: expected yields), buy_limit, price_slow/price_insta, slow_age_s = age of the price_slow quote, fill_volume_24h = 24h trades on the side a patient offer fills against) plus the same summary process_screen returns, and the recipe's source, notes (corrections, caveats) and linked item_relations name if any. meta.harness is the orchestrator's own arithmetic for a lane-P pitch: entry_per_action and exit_per_action (your entry_price and exit_price), gp_hr after slippage and capped at 15% of market volume, units_per_4h (your units_used), and shippable with the reason if not. Call it last before shipping a P strategy. Use it to see which leg limits a recipe; a null buy_limit means the limit is unknown, so the limit rate ignores that leg and is optimistic."),
 		mcp.WithString("recipe", mcp.Required(), mcp.Description("recipe_id from process_screen, or a recipe name")),
 	)
 }
@@ -313,7 +313,7 @@ func ProcessQuoteHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 		}
 
 		env := envelope.New(legs, len(legs))
-		env.Meta = map[string]any{"summary": summary, "source": source}
+		env.Meta = map[string]any{"summary": summary, "source": source, "harness": harnessQuote(summary, legs, relName != "")}
 		if relName != "" {
 			env.Meta["relation_name"] = relName
 			env.Meta["relation_direction"] = relDir
@@ -323,6 +323,90 @@ func ProcessQuoteHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 		}
 		return mcp.NewToolResultText(env.JSON()), nil
 	}
+}
+
+// Lane P's ship-time arithmetic, deliberate duplicates of the orchestrator's
+// (separate Go modules; the same pattern as flip_quote):
+//
+//	participation 0.15, slippage 0.005 -> ge-orchestrator internal/eval/eval.go
+//	floor 250k gp/hr, budget 50M       -> internal/eval/process.go, brief.Defaults
+//
+// Change any of those there and this must move in the same PR train.
+const (
+	processParticipation = 0.15
+	processSlippage      = 0.005
+	processFloorGpHr     = 250_000
+	processBudgetGp      = 50_000_000
+)
+
+// processHarness is what the orchestrator will compute for a lane-P pitch. The
+// view's gp_hr assumes 100% of market volume and exact prices, which the harness
+// doesn't: Making Anguish Uncut reads 3.2M there and about 159k here. Nulls are
+// signal: an unpriceable recipe has null numbers, never zero.
+type processHarness struct {
+	EntryPerAction *float64 `json:"entry_per_action"` // input cost + fee; the strategy's entry_price
+	ExitPerAction  *float64 `json:"exit_per_action"`  // post-tax output; the strategy's exit_price
+	MarginHaircut  *float64 `json:"margin_haircut"`   // margin_slow minus slippage both sides
+	ActionsPerHour *float64 `json:"actions_per_hour"` // min(player, buy limit, 15% of market, budget)
+	GpHr           *float64 `json:"gp_hr"`            // what realized pace is judged against
+	UnitsPer4h     *int64   `json:"units_per_4h"`     // the strategy's size.units_used
+	ClearsFloor    bool     `json:"clears_p_floor"`
+	Shippable      bool     `json:"shippable"`
+	Why            string   `json:"why,omitempty"` // why not shippable
+}
+
+func harnessQuote(q processQuoteRow, legs []processLeg, linked bool) processHarness {
+	var h processHarness
+	switch {
+	case linked:
+		h.Why = "this recipe is a C relation: ship it through lane C with combo_quote"
+	case q.Throughput == "unknown":
+		h.Why = "no known rate: the harness can't size it"
+	case q.UnknownLimitLegs > 0:
+		h.Why = "a leg has no known buy limit"
+	}
+	var in, out float64
+	for _, l := range legs {
+		if l.Qty == nil || l.PriceSlow == nil {
+			if h.Why == "" {
+				h.Why = "a leg has no price right now"
+			}
+			return h
+		}
+		if l.Side == "buy" {
+			in += *l.Qty * float64(*l.PriceSlow)
+		} else {
+			out += *l.Qty * float64(*l.PriceSlow)
+		}
+	}
+	if q.MarginSlow == nil || q.MarketActionsPerHour == nil || in <= 0 {
+		if h.Why == "" {
+			h.Why = "a leg has no price right now"
+		}
+		return h
+	}
+	entry := in + q.FeeGp
+	exit := entry + *q.MarginSlow
+	margin := *q.MarginSlow - processSlippage*(in+out)
+	rate := processParticipation * *q.MarketActionsPerHour
+	if budget := processBudgetGp / in / 4; budget < rate {
+		rate = budget
+	}
+	for _, bound := range []*float64{q.ActionsPerHour, q.LimitActionsPerHour} {
+		if bound != nil && *bound < rate {
+			rate = *bound
+		}
+	}
+	gp := margin * rate
+	units := int64(rate * 4)
+	h.EntryPerAction, h.ExitPerAction, h.MarginHaircut = &entry, &exit, &margin
+	h.ActionsPerHour, h.GpHr, h.UnitsPer4h = &rate, &gp, &units
+	h.ClearsFloor = gp >= processFloorGpHr
+	h.Shippable = h.Why == "" && h.ClearsFloor
+	if h.Why == "" && !h.ClearsFloor {
+		h.Why = "under the 250k gp/hr floor at honest size"
+	}
+	return h
 }
 
 // ---------------------------------------------------------------------------
