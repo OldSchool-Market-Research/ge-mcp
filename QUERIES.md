@@ -623,9 +623,10 @@ exactly — deliberate constant duplication across modules, cross-referenced in 
 files: participation 0.15, slippage 0.005, 4h cycle, `vol30m` = both sides of
 `prices_5m` summed over 30 min (the evaluator's own snapshot window). Summary:
 `fillable_units = max(1, ⌊0.15 × vol30m × 8⌋)`, `units_capped = min(units,
-fillable_units)`, `per_cycle_ceiling = margin × units_capped`, `vet_max_claim = 2 ×
-ceiling` (claims above are vetoed), `harness_per_1h` (slipped, taxed,
-participation-capped, ÷4 — the confirm-ratio denominator), plus `buy_limit` and the
+fillable_units)`, `per_cycle_ceiling = margin × units_capped`, `vet_max_claim = 1 ×
+ceiling` (claims above are vetoed; the 2× slack was removed 2026-10-30), `harness_per_1h` (slipped, taxed,
+participation-capped, ÷4 — the confirm-ratio denominator), `harness_per_cycle` (×4) with
+`clears_f_floor` (lane F is vetoed when the projection is under 400k), plus `buy_limit` and the
 #22 persistence stats. Null margin ⇒ null ceiling with a note (nulls are signal).
 Exists because the first post-gate week vetoed 35 of 37 ships on exactly this
 arithmetic, which the agent could not run. Validated live on Prayer potion(4) (both
