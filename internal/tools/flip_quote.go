@@ -26,8 +26,11 @@ import (
 //	  -> ge-orchestrator/internal/eval/eval.go (defaultParticipation,
 //	     defaultSlippage), flip.go (flipCycleHours, ProjectFlipPer1h)
 //	fillable = max(1, floor(0.15 x vol30m x 8)); ceiling = margin x
-//	  min(units, fillable); veto above 2 x ceiling
+//	  min(units, fillable); veto above 1 x ceiling (the old 2x slack was removed
+//	  2026-10-30: 43 of 81 F ships rode it past their own harness projection)
 //	  -> ge-orchestrator/internal/runner/vet.go (evSanity, evSanityFactor)
+//	F: harness_per_1h x 4 must clear the 400k lane floor
+//	  -> ge-orchestrator/internal/runner/vet.go (flipProjectionVeto)
 //
 // Change any of those there and this tool must move in the same PR train.
 //
@@ -58,7 +61,8 @@ const (
 	flipParticipation = 0.15
 	flipSlippage      = 0.005
 	flipCycleHours    = 4
-	flipVetFactor     = 2
+	flipVetFactor     = 1
+	flipFloorF        = int64(400_000) // lane-F floor per 4h cycle (vet.go floorFPerCycleGp)
 	flipSellTaxCap    = int64(5_000_000)
 )
 
@@ -89,7 +93,7 @@ type flipQuoteRow struct {
 
 func NewFlipQuoteTool() mcp.Tool {
 	return mcp.NewTool("flip_quote",
-		mcp.WithDescription("Size a lane-F/B pitch against the orchestrator's OWN ship-time arithmetic — call this (then quote) as the LAST two calls before shipping any flip. Returns fillable_units = max(1, floor(15% of vol30m x 8)) and per_cycle_ceiling = stored post-tax margin x min(units, fillable_units): the harness recomputes exactly this at ship time and VETOES any per_cycle_gp claim above vet_max_claim = 2 x ceiling. Set per_cycle_gp no higher than per_cycle_ceiling. harness_per_1h is the harness's own projection of your offers (slippage 0.5% both sides, sell tax, participation-capped, one 4h cycle) — the denominator your realized pace is judged against. Also carries buy_limit (your other sizing bound) and the persistence stats (the 0.4 lane-F gate reference). Null margin or a missing leg makes ceiling/projection null: the flip is unpriceable right now, not free."),
+		mcp.WithDescription("Size a lane-F/B pitch against the orchestrator's OWN ship-time arithmetic — call this (then quote) as the LAST two calls before shipping any flip. Returns fillable_units = max(1, floor(15% of vol30m x 8)) and per_cycle_ceiling = stored post-tax margin x min(units, fillable_units): the harness recomputes exactly this at ship time and VETOES any per_cycle_gp claim above vet_max_claim (= per_cycle_ceiling: there is no slack). harness_per_1h is the harness's own projection of your offers (slippage 0.5% both sides, sell tax, participation-capped, one 4h cycle) — the denominator your realized pace is judged against; harness_per_cycle = harness_per_1h x 4, and a lane-F ship whose harness_per_cycle is under the 400k floor is vetoed (clears_f_floor). Also carries buy_limit (your other sizing bound) and the persistence stats (the 0.4 lane-F gate reference). Null margin or a missing leg makes ceiling/projection null: the flip is unpriceable right now, not free."),
 		mcp.WithString("name_or_id", mcp.Required(), mcp.Description("Item name (fuzzy, best match) or numeric item_id")),
 		mcp.WithNumber("units", mcp.Required(), mcp.Description("Your intended units_used (the size field of the pitch)")),
 		mcp.WithNumber("entry_price", mcp.Description("Your intended buy offer; defaults to the live low")),
@@ -185,13 +189,20 @@ func FlipQuoteHandler(pool *pgxpool.Pool) server.ToolHandlerFunc {
 			slipEntry := int64(float64(entry) * (1 + flipSlippage))
 			perUnit := slipExit - slipEntry - flipSellTax(slipExit)
 			if perUnit > 0 {
-				summary["harness_per_1h"] = perUnit * cappedUnits / flipCycleHours
+				per1h := perUnit * cappedUnits / flipCycleHours
+				summary["harness_per_1h"] = per1h
+				summary["harness_per_cycle"] = per1h * flipCycleHours
+				summary["clears_f_floor"] = per1h*flipCycleHours >= flipFloorF
 			} else {
 				summary["harness_per_1h"] = nil
+				summary["harness_per_cycle"] = nil
+				summary["clears_f_floor"] = false
 				summary["projection_note"] = "offers do not clear slippage + tax — harness projection is null"
 			}
 		} else {
 			summary["harness_per_1h"] = nil
+			summary["harness_per_cycle"] = nil
+			summary["clears_f_floor"] = false
 		}
 		summary["entry_used"] = entry
 		summary["exit_used"] = exit
